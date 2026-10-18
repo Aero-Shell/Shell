@@ -7,13 +7,95 @@ use std::borrow::Cow;
 use std::io::IsTerminal;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 
 use aeroshell::{config, registry};
 
 mod commands;
 
 use commands::builtins;
+
+// While a foreground external command runs, the terminal delivers Ctrl-C
+// (SIGINT) to every process in the foreground process group — including the
+// shell itself. With no disposition, that signal kills Ash outright
+// ("Warning: Program '...aero' crashed."), so ignore the terminal signals for
+// the duration of the command and restore the previous behavior on drop.
+#[cfg(unix)]
+struct InterruptGuard {
+    previous: Vec<(i32, libc::sigaction)>,
+}
+
+#[cfg(unix)]
+impl InterruptGuard {
+    fn acquire() -> Self {
+        let mut previous = Vec::new();
+        for sig in [libc::SIGINT, libc::SIGQUIT] {
+            unsafe {
+                let mut ignore: libc::sigaction = std::mem::zeroed();
+                ignore.sa_sigaction = libc::SIG_IGN;
+                let mut old: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, &ignore, &mut old) == 0 {
+                    previous.push((sig, old));
+                }
+            }
+        }
+        Self { previous }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        for (sig, old) in self.previous.drain(..) {
+            unsafe {
+                libc::sigaction(sig, &old, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+// Restore the default terminal-signal dispositions in the child before exec:
+// the ignore flag the shell installed would otherwise leak across exec and
+// leave the child unable to die from Ctrl-C (e.g. ssh or ping wouldn't stop).
+#[cfg(unix)]
+unsafe fn reset_child_signals() {
+    for sig in [libc::SIGINT, libc::SIGQUIT] {
+        unsafe {
+            let mut dfl: libc::sigaction = std::mem::zeroed();
+            dfl.sa_sigaction = libc::SIG_DFL;
+            libc::sigaction(sig, &dfl, std::ptr::null_mut());
+        }
+    }
+}
+
+// Report a foreground child's exit. Children killed by a signal have no
+// numeric exit code (they'd print as "return code -1"), and Ctrl-C exits are
+// the normal way to stop a foreground command, so those stay quiet like in
+// other shells. Genuine failures keep the old message.
+fn report_exit_status(status: &ExitStatus) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            if sig != libc::SIGINT && sig != libc::SIGQUIT {
+                registry::print_colored(
+                    &format!("ash: command terminated by signal {sig}"),
+                    "warning",
+                );
+            }
+            return;
+        }
+    }
+    if !status.success() {
+        let code = status.code().unwrap_or(-1);
+        if code != 130 {
+            registry::print_colored(
+                &format!("External command failed with return code {code}."),
+                "error",
+            );
+        }
+    }
+}
 
 // Feeds the (pre-styled) prompt back to rustyline and strips ANSI codes for
 // width computation, so colored prompts keep correct cursor positioning.
@@ -338,6 +420,12 @@ fn split_pipeline(line: &str) -> Vec<String> {
 // Run `cmd1 | cmd2 | …`. Only the last stage writes to the terminal; stages
 // external on PATH (a builtin can't feed a pipe).
 fn run_pipeline(stages: &[Vec<String>]) -> Result<()> {
+    // The shell ignores Ctrl-C while the command runs; this restores the
+    // previous signal behavior when the guard is dropped. Acquired before the
+    // first spawn so a Ctrl-C can't slip in between spawn and wait.
+    #[cfg(unix)]
+    let _interrupt_guard = InterruptGuard::acquire();
+
     let mut children: Vec<Child> = Vec::new();
     let mut prev_stdout: Option<ChildStdout> = None;
 
@@ -374,6 +462,14 @@ fn run_pipeline(stages: &[Vec<String>]) -> Result<()> {
             cmd.stdout(Stdio::inherit());
         }
 
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                reset_child_signals();
+                Result::<(), std::io::Error>::Ok(())
+            });
+        }
+
         match cmd.spawn() {
             Ok(mut child) => {
                 prev_stdout = child.stdout.take();
@@ -393,14 +489,8 @@ fn run_pipeline(stages: &[Vec<String>]) -> Result<()> {
     }
 
     // Pipeline status is its last stage's.
-    if let Some(status) = last_status
-        && !status.success()
-    {
-        let code = status.code().unwrap_or(-1);
-        registry::print_colored(
-            &format!("External command failed with return code {code}."),
-            "error",
-        );
+    if let Some(status) = last_status {
+        report_exit_status(&status);
     }
 
     Ok(())
@@ -462,14 +552,22 @@ fn run_external_cmd(name: &str, path: &str, args: &[&str]) -> Result<()> {
     // Same argv[0] rule as the pipeline path: typed name, not resolved path.
     #[cfg(unix)]
     let _ = command.arg0(name);
-    let status = command.args(args).status()?;
+    command.args(args);
 
-    if !status.success() {
-        let code = status.code().unwrap_or(-1);
-        registry::print_colored(
-            &format!("External command failed with return code {code}."),
-            "error",
-        );
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            reset_child_signals();
+            Result::<(), std::io::Error>::Ok(())
+        });
     }
+
+    // Ignore Ctrl-C in the shell while the command runs; the child keeps its
+    // own default handling via reset_child_signals().
+    #[cfg(unix)]
+    let _interrupt_guard = InterruptGuard::acquire();
+
+    let status = command.status()?;
+    report_exit_status(&status);
     Ok(())
 }
