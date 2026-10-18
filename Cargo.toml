@@ -1,0 +1,15 @@
+[package]
+name = "aeroshell"
+version = "1.0.3"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+chrono = "0.4"
+dirs = "5"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rustyline = "18.0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shlex = "1"
