@@ -138,7 +138,7 @@ Delete the directory to reset Ash to defaults.
 
 ## Contributing
 
-Issues and PRs welcome, target the `dev` branch. Keep changes small and
+Issues and PRs welcome, target the `main` branch. Keep changes small and
 matching the existing style, `cargo build` with no warnings
 
 ```bash
