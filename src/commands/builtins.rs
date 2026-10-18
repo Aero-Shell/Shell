@@ -84,8 +84,7 @@ pub fn ls(args: &[&str]) -> Result<()> {
                 continue;
             }
             let (_, name, key, _) = &items[idx];
-            let is_last_col =
-                col == num_cols - 1 || (col + 1) * num_rows + row >= items.len();
+            let is_last_col = col == num_cols - 1 || (col + 1) * num_rows + row >= items.len();
             let padded = if is_last_col {
                 name.clone()
             } else {
@@ -305,21 +304,25 @@ pub fn alias(args: &[&str]) -> Result<()> {
                 println!("{name} -> {command}");
             }
         }
-        ["create", name, command @ ..] => {
+        ["create", name, command] => {
             if !is_valid_name(name) {
                 registry::print_colored(&format!("alias: invalid name: {name}"), "error");
                 return Ok(());
             }
-            if command.is_empty() {
-                registry::print_colored("alias create: missing command", "warning");
-                return Ok(());
-            }
-            let command = command
-                .iter()
+            // Keep the command's literal spaces intact: the argument is one
+            // single string (e.g. `alias create aerotest 'bash /home/.../test.sh'`),
+            // so parse it back to its real tokens before quoting.
+            // `shlex::split` returns `&[&str]`; convert to owned `String`
+            // so `try_quote` can borrow it and we keep the owned output.
+            // `shlex::split` returns `Option<Vec<String>>` of owned `String`
+            // tokens, so we don't need to re-encode the separator ourselves.
+            let command = shlex::split(command)
+                .unwrap_or_default()
+                .into_iter()
                 .map(|part| {
-                    shlex::try_quote(part)
+                    shlex::try_quote(&part)
                         .map(|quoted| quoted.into_owned())
-                        .unwrap_or_else(|_| (*part).to_string())
+                        .unwrap_or_else(|_| part)
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
