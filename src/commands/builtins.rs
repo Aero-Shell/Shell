@@ -195,7 +195,11 @@ pub fn ver(_args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-pub fn help(_args: &[&str]) -> Result<()> {
+pub fn help(args: &[&str]) -> Result<()> {
+    if let Some(name) = args.first() {
+        return help_one(name);
+    }
+
     registry::print_colored("Ash Help - Available Commands:", "header");
 
     let help_text = [
@@ -215,6 +219,7 @@ pub fn help(_args: &[&str]) -> Result<()> {
         ("alias ls", "List aliases"),
         ("alias rm <alias>", "Remove an alias"),
         ("type <cmd>", "Show how a command resolves (also: which)"),
+        ("help [cmd]", "Show help; with a command, tell you how to get its help"),
         (
             "aepkg <subcommand>",
             "Manage packages (list, install, remove, reload)",
@@ -227,6 +232,22 @@ pub fn help(_args: &[&str]) -> Result<()> {
         println!("  {cmd:<34} - {desc}");
     }
 
+    Ok(())
+}
+
+fn help_one(name: &str) -> Result<()> {
+    if registry::resolve(name).is_some() {
+        println!("{name} is a shell builtin. Run `help` for the full list.");
+        return Ok(());
+    }
+    if let Some(path) = which_cmd(name) {
+        println!(
+            "{name} is an external command ({path}).",
+        );
+        println!("Run `{name} --help` for its own help.");
+        return Ok(());
+    }
+    registry::print_colored(&format!("help: no such command: {name}"), "error");
     Ok(())
 }
 
