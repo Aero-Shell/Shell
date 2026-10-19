@@ -91,6 +91,7 @@ Built-in commands (also listed by `help`):
 | `alias ls` | List aliases |
 | `alias rm <alias>` | Remove an alias |
 | `type <cmd>` / `which <cmd>` | Show how a command resolves |
+| `aepkg <subcommand>` | Manage packages (`list`, `install`, `remove`, `reload`, …) |
 | `ver` | Show Ash version |
 | `help` | Command list |
 | `exit` / `quit` | Exit |
@@ -127,12 +128,28 @@ Standard ANSI names (`red green blue yellow magenta cyan white bold italic
 underline dim highlight`, plus extras like `orange purple teal`) all work in
 the template.
 
+## Packages
+
+Ash packages add Lua commands, completions, colors, aliases, prompt pieces and
+hooks. Install one from a local directory and use its commands right away:
+
+```bash
+aepkg install examples/packages/hello
+aepkg install /user/repo                         # GitHub shorthand
+aepkg install https://github.com/user/repo        # or a .tar.gz / .zip link
+hello Neo --loud
+aepkg list
+```
+
+See [docs/packages.md](docs/packages.md) for the manifest format and Lua API.
+
 ## Data directories
 
 AeroShell keeps all its state in `~/.aeroshell/`:
 
 - `config.json` — settings, colors, aliases
 - `history.txt` — command history
+- `packages/` — installed package trees and `index.json`
 
 Delete the directory to reset Ash to defaults.
 
@@ -152,7 +169,9 @@ Code layout:
 
 - `src/main.rs` — REPL, arg parsing, pipelines, login-shell handling
 - `src/commands/builtins.rs` — built-in commands
+- `src/commands/aepkg.rs` — package manager command
 - `src/config.rs` — config, themes, prompt rendering
+- `src/packages/` — manifests, installed index, package loading, Lua bridge
 - `src/registry.rs` — command registry
 
 ## License

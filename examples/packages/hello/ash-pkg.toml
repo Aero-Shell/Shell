@@ -1,0 +1,26 @@
+name = "hello"
+version = "1.0.0"
+language = "lua"
+description = "Example package: a greeting command with completions and a prompt piece"
+priority = 10
+
+[[commands]]
+name = "hello"
+entry = "commands/hello.lua"
+
+[[completions]]
+command = "hello"
+definition = "completions/hello.lua"
+
+[init]
+entrypoint = "init.lua"
+
+[contributions.aliases.aliases]
+hi = "hello"
+
+[contributions.prompt]
+template = "<green>➜</green> <blue>{hostname}</blue> <yellow>{pwd}</yellow> <bright_black>{{hello_username}}</bright_black> <green>➜</green> "
+
+[[contributions.prompt.pieces]]
+name = "hello_username"
+template = "hello {username}"

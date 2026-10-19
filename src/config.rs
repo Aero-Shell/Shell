@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 // Standard ANSI names usable in `<tag>` prompt templates.
 fn standard_ansi(name: &str) -> Option<&'static str> {
@@ -201,6 +201,21 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("config.json"))
 }
 
+// Root directory for installed packages.
+pub fn packages_dir() -> Result<PathBuf> {
+    Ok(config_dir()?.join("packages"))
+}
+
+// Where unpacked package trees live, one directory per package name.
+pub fn package_store_dir() -> Result<PathBuf> {
+    Ok(packages_dir()?.join("store"))
+}
+
+// JSON index of installed packages.
+pub fn package_index_path() -> Result<PathBuf> {
+    Ok(packages_dir()?.join("index.json"))
+}
+
 pub fn load_config() -> Result<Config> {
     let path = config_path()?;
     let default = default_config();
@@ -337,91 +352,157 @@ pub fn ansi_for_color_key(key: &str) -> String {
     get_color(key)
 }
 
+// Named prompt snippets contributed by packages. They are referenced from a
+// prompt template as `{{name}}`; repeat registrations replace the old snippet.
+pub static PROMPT_PIECES: LazyLock<Mutex<Vec<(String, String)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+pub fn set_prompt_pieces(pieces: Vec<(String, String)>) {
+    *PROMPT_PIECES.lock().expect("prompt piece lock poisoned") = pieces;
+}
+
+pub fn add_prompt_piece(name: &str, template: &str) {
+    if name.trim().is_empty() || template.trim().is_empty() {
+        return;
+    }
+    let mut pieces = PROMPT_PIECES.lock().expect("prompt piece lock poisoned");
+    if let Some(existing) = pieces.iter_mut().find(|(n, _)| n == name) {
+        existing.1 = template.to_string();
+    } else {
+        pieces.push((name.to_string(), template.to_string()));
+    }
+}
+
+pub fn prompt_pieces() -> Vec<(String, String)> {
+    PROMPT_PIECES
+        .lock()
+        .expect("prompt piece lock poisoned")
+        .clone()
+}
+
+struct PromptContext {
+    username: String,
+    hostname: String,
+    pwd: String,
+    short_pwd: String,
+    time: String,
+    date: String,
+    battery: String,
+    git: String,
+    colors: HashMap<String, String>,
+    reset: String,
+}
+
+impl PromptContext {
+    fn new(cfg: &Config) -> Self {
+        let hostname = crate::hostname::gethostname().unwrap_or_else(|| "localhost".into());
+        let pwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "/".into());
+        let short_pwd = std::path::Path::new(&pwd)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".into());
+        let now = chrono::Local::now();
+        let time = match cfg.time_format.as_str() {
+            "12" => now.format("%Y-%m-%d %I:%M:%S %p").to_string(),
+            _ => now.format("%Y-%m-%d %H:%M:%S").to_string(),
+        };
+        let date = now.format("%Y-%m-%d").to_string();
+        let reset = cfg
+            .colors
+            .get("reset")
+            .cloned()
+            .unwrap_or_else(|| "\x1b[0m".into());
+
+        Self {
+            username: cfg.username.clone(),
+            hostname,
+            pwd,
+            short_pwd,
+            time,
+            date,
+            battery: crate::sysinfo::battery_percent(),
+            git: git_branch(),
+            colors: cfg.colors.clone(),
+            reset,
+        }
+    }
+
+    // Color tags first (palette keys override standard names), then values.
+    fn render(&self, template: &str) -> String {
+        let mut output = template.to_string();
+        for (key, code) in &self.colors {
+            output = output.replace(&format!("<{key}>"), code);
+            output = output.replace(&format!("</{key}>"), &self.reset);
+        }
+        for name in [
+            "black",
+            "red",
+            "green",
+            "yellow",
+            "blue",
+            "magenta",
+            "cyan",
+            "aqua",
+            "white",
+            "bright_black",
+            "bright_red",
+            "bright_green",
+            "bright_yellow",
+            "bright_blue",
+            "bright_magenta",
+            "bright_cyan",
+            "bright_white",
+            "bold",
+            "italic",
+            "underline",
+            "strikethrough",
+            "dim",
+            "highlight",
+        ] {
+            if self.colors.contains_key(name) {
+                continue;
+            }
+            if let Some(code) = standard_ansi(name) {
+                output = output.replace(&format!("<{name}>"), code);
+                output = output.replace(&format!("</{name}>"), &self.reset);
+            }
+        }
+
+        let replace_map = [
+            ("{username}", self.username.as_str()),
+            ("{hostname}", self.hostname.as_str()),
+            ("{pwd}", self.pwd.as_str()),
+            ("{short_pwd}", self.short_pwd.as_str()),
+            ("{time}", self.time.as_str()),
+            ("{date}", self.date.as_str()),
+            ("{battery}", self.battery.as_str()),
+            ("{git}", self.git.as_str()),
+        ];
+        for (placeholder, value) in &replace_map {
+            output = output.replace(placeholder, value);
+        }
+        output
+    }
+}
+
 pub fn format_prompt(template: &str) -> String {
     let cfg = match active_config() {
         Ok(c) => c,
         Err(_) => return template.to_string(),
     };
+    let ctx = PromptContext::new(&cfg);
+    let mut output = ctx.render(template);
 
-    let hostname = crate::hostname::gethostname().unwrap_or_else(|| "localhost".into());
-
-    let pwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "/".into());
-    let short_pwd = std::path::Path::new(&pwd)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "/".into());
-
-    let now = chrono::Local::now();
-    let time_str = match cfg.time_format.as_str() {
-        "12" => now.format("%Y-%m-%d %I:%M:%S %p").to_string(),
-        _ => now.format("%Y-%m-%d %H:%M:%S").to_string(),
-    };
-    let date_str = now.format("%Y-%m-%d").to_string();
-
-    let battery = crate::sysinfo::battery_percent();
-
-    let mut output = template.to_string();
-
-    // Replace color tags: palette keys first, then standard ANSI names.
-    let reset = cfg
-        .colors
-        .get("reset")
-        .cloned()
-        .unwrap_or_else(|| "\x1b[0m".into());
-    for (key, code) in &cfg.colors {
-        output = output.replace(&format!("<{key}>"), code);
-        output = output.replace(&format!("</{key}>"), &reset);
-    }
-    for name in [
-        "black",
-        "red",
-        "green",
-        "yellow",
-        "blue",
-        "magenta",
-        "cyan",
-        "aqua",
-        "white",
-        "bright_black",
-        "bright_red",
-        "bright_green",
-        "bright_yellow",
-        "bright_blue",
-        "bright_magenta",
-        "bright_cyan",
-        "bright_white",
-        "bold",
-        "italic",
-        "underline",
-        "strikethrough",
-        "dim",
-        "highlight",
-    ] {
-        if cfg.colors.contains_key(name) {
-            continue;
+    // Expand `{{name}}` prompt pieces contributed by packages. Piece contents
+    // are rendered once, so a piece cannot recurse into another piece.
+    for (name, piece_template) in prompt_pieces() {
+        let placeholder = format!("{{{{{name}}}}}");
+        if output.contains(&placeholder) {
+            let rendered = ctx.render(&piece_template);
+            output = output.replace(&placeholder, &rendered);
         }
-        if let Some(code) = standard_ansi(name) {
-            output = output.replace(&format!("<{name}>"), code);
-            output = output.replace(&format!("</{name}>"), &reset);
-        }
-    }
-
-    let git = git_branch();
-    let replace_map = [
-        ("{username}", cfg.username.as_str()),
-        ("{hostname}", hostname.as_str()),
-        ("{pwd}", pwd.as_str()),
-        ("{short_pwd}", short_pwd.as_str()),
-        ("{time}", time_str.as_str()),
-        ("{date}", date_str.as_str()),
-        ("{battery}", battery.as_str()),
-        ("{git}", git.as_str()),
-    ];
-
-    for (placeholder, value) in &replace_map {
-        output = output.replace(placeholder, value);
     }
 
     output
