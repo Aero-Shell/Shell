@@ -98,6 +98,17 @@ Built-in commands (also listed by `help`):
 
 CLI flags: `ash --help`, `ash --version`, `ash --set-default`, `ash -c '<cmd>'`.
 
+One-liners work like a POSIX shell: pipelines (`|`), sequencing (`&&`, `||`,
+`;`) and redirection (`<`, `>`, `>>`, `2>`, `2>>`, `2>&1`, `&>`) all apply per
+command, and builtins or package commands can be pipeline stages:
+
+```bash
+cargo build && ./target/release/aeroshell --help
+ls -la > /tmp/out.txt && cat < /tmp/out.txt
+false && echo skipped || echo ran
+history 20 | tail
+```
+
 ## Configuration
 
 Everything lives in `~/.aeroshell/`:

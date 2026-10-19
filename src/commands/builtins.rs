@@ -219,7 +219,10 @@ pub fn help(args: &[&str]) -> Result<()> {
         ("alias ls", "List aliases"),
         ("alias rm <alias>", "Remove an alias"),
         ("type <cmd>", "Show how a command resolves (also: which)"),
-        ("help [cmd]", "Show help; with a command, tell you how to get its help"),
+        (
+            "help [cmd]",
+            "Show help; with a command, tell you how to get its help",
+        ),
         (
             "aepkg <subcommand>",
             "Manage packages (list, install, remove, reload)",
@@ -241,9 +244,7 @@ fn help_one(name: &str) -> Result<()> {
         return Ok(());
     }
     if let Some(path) = which_cmd(name) {
-        println!(
-            "{name} is an external command ({path}).",
-        );
+        println!("{name} is an external command ({path}).",);
         println!("Run `{name} --help` for its own help.");
         return Ok(());
     }
@@ -512,7 +513,7 @@ fn quote_if_needed(candidate: &str) -> String {
 }
 
 // Expand a leading `~` or `~/…` to the home directory.
-fn expand_tilde(word: &str) -> PathBuf {
+pub fn expand_tilde(word: &str) -> PathBuf {
     if word == "~"
         && let Some(home) = dirs::home_dir()
     {
