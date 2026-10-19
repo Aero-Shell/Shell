@@ -297,10 +297,18 @@ fn main() -> Result<()> {
 // Run one command line (a whole `cmd | cmd | …` pipeline). Returns Ok(None)
 // when the line was exit/quit, otherwise the status of the last command.
 fn run_command_line(line: &str) -> Result<Option<i32>> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        // Blank lines and `#` comments are no-ops. shlex would otherwise strip
+        // a `# ..` line to an empty token list and report a misleading "syntax
+        // error near unexpected token '|'" — the `|` is just the generic message,
+        // not the actual problem.
+        return Ok(Some(0));
+    }
     // Split on unquoted `|` first, then tokenize each stage.
     let mut stages: Vec<Vec<String>> = Vec::new();
     let mut syntax_error = false;
-    for stage in split_pipeline(line) {
+    for stage in split_pipeline(trimmed) {
         match split(&stage) {
             Some(tokens) if !tokens.is_empty() => stages.push(tokens),
             _ => {
