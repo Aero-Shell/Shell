@@ -1,5 +1,6 @@
 pub mod config;
 pub mod hostname;
+pub mod packages;
 pub mod registry;
 pub mod sysinfo;
 

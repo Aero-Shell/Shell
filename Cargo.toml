@@ -7,9 +7,14 @@ edition = "2024"
 anyhow = "1.0"
 chrono = "0.4"
 dirs = "5"
+flate2 = "1.1.10"
 libc = "0.2"
+mlua = { version = "0.12.2", features = ["lua54", "vendored"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rustyline = "18.0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shlex = "1"
+tar = "0.4.46"
+toml = "1"
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }

@@ -4,15 +4,16 @@ use rustyline::history::DefaultHistory;
 use rustyline::{CompletionType, Config as RLConfig, Editor};
 use shlex::split;
 use std::borrow::Cow;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 
-use aeroshell::{config, registry};
+use aeroshell::{config, packages, registry};
 
 mod commands;
 
+use commands::aepkg as aepkg_cmd;
 use commands::builtins;
 
 // While a foreground external command runs, the terminal delivers Ctrl-C
@@ -68,11 +69,13 @@ unsafe fn reset_child_signals() {
     }
 }
 
-// Report a foreground child's exit. Children killed by a signal have no
-// numeric exit code (they'd print as "return code -1"), and Ctrl-C exits are
-// the normal way to stop a foreground command, so those stay quiet like in
-// other shells. Genuine failures keep the old message.
-fn report_exit_status(status: &ExitStatus) {
+// Translate a foreground child's exit into the status the shell hands back.
+// A non-zero exit is the command's own business: it already explained itself on
+// stderr, so Ash stays quiet like other shells. Children killed by a signal
+// have no numeric code; report the unexpected ones and use the conventional
+// 128+signal. Ctrl-C/Ctrl-\ exits are the normal way to stop a foreground
+// command, so those stay quiet too.
+fn exit_code(status: &ExitStatus) -> i32 {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -83,18 +86,10 @@ fn report_exit_status(status: &ExitStatus) {
                     "warning",
                 );
             }
-            return;
+            return 128 + sig;
         }
     }
-    if !status.success() {
-        let code = status.code().unwrap_or(-1);
-        if code != 130 {
-            registry::print_colored(
-                &format!("External command failed with return code {code}."),
-                "error",
-            );
-        }
-    }
+    status.code().unwrap_or(1)
 }
 
 // Feeds the (pre-styled) prompt back to rustyline and strips ANSI codes for
@@ -117,7 +112,17 @@ impl rustyline::completion::Completer for AeroHelper {
         let mut candidates = if completing_command {
             builtins::command_candidates(word)
         } else {
-            builtins::path_candidates(word)
+            // Argument completions contributed by packages win over path
+            // completion, but fall back to paths when none match.
+            let head = line[..start].split_whitespace().next().unwrap_or("");
+            let mut package_candidates: Vec<String> = packages::lua_api::completions_for(head)
+                .into_iter()
+                .filter(|candidate| candidate.starts_with(word))
+                .collect();
+            if package_candidates.is_empty() {
+                package_candidates = builtins::path_candidates(word);
+            }
+            package_candidates
         };
         candidates.sort();
         candidates.dedup();
@@ -217,9 +222,18 @@ fn main() -> Result<()> {
     let config = config::load_config()?;
     config::set_config(config);
 
+    // Package failures shouldn't stop the shell from starting; each package
+    // reports its own warning.
+    if let Err(error) = packages::init() {
+        registry::print_colored(&format!("ash: packages unavailable: {error:#}"), "warning");
+    }
+
     if let Some(cmd) = shell_args.command {
-        run_command_line(&cmd)?;
-        return Ok(());
+        // `-c` exits with the command's status, like other shells. exit()
+        // skips destructors, so flush first in case output is still buffered.
+        let status = run_command_line(&cmd)?.unwrap_or(0);
+        std::io::stdout().flush().ok();
+        std::process::exit(status);
     }
 
     registry::print_colored("Type help for commands.", "success");
@@ -239,6 +253,9 @@ fn main() -> Result<()> {
     }
 
     loop {
+        if let Err(error) = packages::lua_api::run_prompt_hooks() {
+            registry::print_colored(&format!("ash: prompt hook failed: {error:#}"), "warning");
+        }
         let config_guard = config::active_config()?;
         let template = config_guard.prompt_template.clone();
         let prompt = config::format_prompt(&template);
@@ -278,8 +295,8 @@ fn main() -> Result<()> {
 }
 
 // Run one command line (a whole `cmd | cmd | …` pipeline). Returns Ok(None)
-// when the line was exit/quit.
-fn run_command_line(line: &str) -> Result<Option<()>> {
+// when the line was exit/quit, otherwise the status of the last command.
+fn run_command_line(line: &str) -> Result<Option<i32>> {
     // Split on unquoted `|` first, then tokenize each stage.
     let mut stages: Vec<Vec<String>> = Vec::new();
     let mut syntax_error = false;
@@ -295,12 +312,12 @@ fn run_command_line(line: &str) -> Result<Option<()>> {
 
     if syntax_error {
         registry::print_colored("ash: syntax error near unexpected token '|'", "error");
-        return Ok(Some(()));
+        return Ok(Some(2));
     }
 
     expand_aliases(&mut stages);
 
-    if stages.len() == 1 {
+    let status = if stages.len() == 1 {
         let cmd = stages[0][0].clone();
         let args: Vec<&str> = stages[0][1..].iter().map(|s| s.as_str()).collect();
 
@@ -311,20 +328,45 @@ fn run_command_line(line: &str) -> Result<Option<()>> {
 
         if cmd == "unalias" {
             registry::print_colored("ash: command not found: unalias", "error");
-        } else if let Some(handler) = registry::resolve(&cmd) {
-            if let Err(e) = handler(&args) {
-                registry::print_colored(&format!("Uncaught Error: {e}"), "error");
-            }
-        } else if let Some(path) = builtins::which_cmd(&cmd) {
-            run_external_cmd(&cmd, &path, &args)?;
+            127
         } else {
-            registry::print_colored(&format!("ash: command not found: {cmd}"), "error");
+            if let Err(error) = packages::lua_api::run_command_hooks(&cmd, &args) {
+                registry::print_colored(&format!("ash: command hook failed: {error:#}"), "warning");
+            }
+
+            packages::lua_api::clear_last_exit_status();
+            let status = if let Some(handler) = registry::resolve(&cmd) {
+                match handler(&args) {
+                    // Package commands report their Lua return value this way;
+                    // builtins leave it unset.
+                    Ok(()) => packages::lua_api::take_last_exit_status().unwrap_or(0),
+                    Err(e) => {
+                        registry::print_colored(&format!("Uncaught Error: {e}"), "error");
+                        1
+                    }
+                }
+            } else if let Some(path) = builtins::which_cmd(&cmd) {
+                run_external_cmd(&cmd, &path, &args)?
+            } else {
+                registry::print_colored(&format!("ash: command not found: {cmd}"), "error");
+                127
+            };
+
+            // Hooks see the real status, whether the command was a builtin,
+            // a package command, or an external binary.
+            if let Err(error) = packages::lua_api::run_command_done_hooks(&cmd, &args, status) {
+                registry::print_colored(
+                    &format!("ash: command_done hook failed: {error:#}"),
+                    "warning",
+                );
+            }
+            status
         }
     } else {
-        run_pipeline(&stages)?;
-    }
+        run_pipeline(&stages)?
+    };
 
-    Ok(Some(()))
+    Ok(Some(status))
 }
 
 fn register_builtins() {
@@ -350,6 +392,7 @@ fn register_builtins() {
     register("clear", builtins::clear);
     register("help", builtins::help);
     register("ver", builtins::ver);
+    register("aepkg", aepkg_cmd::aepkg);
 }
 
 // Expand aliases in the first word of every pipeline stage, one level deep.
@@ -418,8 +461,9 @@ fn split_pipeline(line: &str) -> Vec<String> {
 }
 
 // Run `cmd1 | cmd2 | …`. Only the last stage writes to the terminal; stages
-// external on PATH (a builtin can't feed a pipe).
-fn run_pipeline(stages: &[Vec<String>]) -> Result<()> {
+// external on PATH (a builtin can't feed a pipe). Returns the last stage's
+// status, which is the pipeline's status.
+fn run_pipeline(stages: &[Vec<String>]) -> Result<i32> {
     // The shell ignores Ctrl-C while the command runs; this restores the
     // previous signal behavior when the guard is dropped. Acquired before the
     // first spawn so a Ctrl-C can't slip in between spawn and wait.
@@ -440,10 +484,10 @@ fn run_pipeline(stages: &[Vec<String>]) -> Result<()> {
                     &format!("ash: builtin '{name}' cannot be piped yet"),
                     "error",
                 );
-            } else {
-                registry::print_colored(&format!("ash: command not found: {name}"), "error");
+                return Ok(1);
             }
-            return Ok(());
+            registry::print_colored(&format!("ash: command not found: {name}"), "error");
+            return Ok(127);
         };
 
         let mut cmd = Command::new(&path);
@@ -478,7 +522,7 @@ fn run_pipeline(stages: &[Vec<String>]) -> Result<()> {
             Err(e) => {
                 abort_pipeline(&mut children);
                 registry::print_colored(&format!("ash: failed to run {name}: {e}"), "error");
-                return Ok(());
+                return Ok(126);
             }
         }
     }
@@ -488,12 +532,9 @@ fn run_pipeline(stages: &[Vec<String>]) -> Result<()> {
         last_status = Some(child.wait()?);
     }
 
-    // Pipeline status is its last stage's.
-    if let Some(status) = last_status {
-        report_exit_status(&status);
-    }
-
-    Ok(())
+    // Pipeline status is its last stage's; earlier stages report through the
+    // last one or not at all, so only translate that status.
+    Ok(last_status.map(|status| exit_code(&status)).unwrap_or(0))
 }
 
 fn abort_pipeline(children: &mut [Child]) {
@@ -547,7 +588,10 @@ fn set_default_shell() -> Result<()> {
     Ok(())
 }
 
-fn run_external_cmd(name: &str, path: &str, args: &[&str]) -> Result<()> {
+// Run a foreground PATH binary and return its status. Spawn failures are
+// reported here instead of bubbling up, so a missing interpreter or an
+// unreadable binary doesn't take the whole shell down.
+fn run_external_cmd(name: &str, path: &str, args: &[&str]) -> Result<i32> {
     let mut command = std::process::Command::new(path);
     // Same argv[0] rule as the pipeline path: typed name, not resolved path.
     #[cfg(unix)]
@@ -567,7 +611,11 @@ fn run_external_cmd(name: &str, path: &str, args: &[&str]) -> Result<()> {
     #[cfg(unix)]
     let _interrupt_guard = InterruptGuard::acquire();
 
-    let status = command.status()?;
-    report_exit_status(&status);
-    Ok(())
+    match command.status() {
+        Ok(status) => Ok(exit_code(&status)),
+        Err(error) => {
+            registry::print_colored(&format!("ash: failed to run {name}: {error}"), "error");
+            Ok(126)
+        }
+    }
 }

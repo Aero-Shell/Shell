@@ -1,24 +1,41 @@
 //! Command registry and console helpers.
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::config;
 
-// Shell command handler type.
+// Shell command handler type. Builtins are plain functions; package commands
+// need to capture their package/command names, so handlers are stored as
+// shared closures.
+pub type CommandHandler = Arc<dyn Fn(&[&str]) -> anyhow::Result<()> + Send + Sync>;
 pub type CommandFn = fn(&[&str]) -> anyhow::Result<()>;
 
-pub static COMMANDS: LazyLock<Mutex<HashMap<String, CommandFn>>> =
+pub static COMMANDS: LazyLock<Mutex<HashMap<String, CommandHandler>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn register(name: &str, fn_: CommandFn) {
-    let mut map = COMMANDS.lock().expect("command registry poisoned");
-    map.insert(name.to_string(), fn_);
+    register_handler(name, fn_);
 }
 
-pub fn resolve(name: &str) -> Option<CommandFn> {
+pub fn register_handler<F>(name: &str, handler: F)
+where
+    F: Fn(&[&str]) -> anyhow::Result<()> + Send + Sync + 'static,
+{
+    let mut map = COMMANDS.lock().expect("command registry poisoned");
+    map.insert(name.to_string(), Arc::new(handler));
+}
+
+// Remove a command. Used when reloading packages so disabled packages no
+// longer shadow anything.
+pub fn unregister(name: &str) {
+    let mut map = COMMANDS.lock().expect("command registry poisoned");
+    map.remove(name);
+}
+
+pub fn resolve(name: &str) -> Option<CommandHandler> {
     let map = COMMANDS.lock().expect("command registry poisoned");
-    map.get(name).copied()
+    map.get(name).cloned()
 }
 
 // All registered command names, sorted.

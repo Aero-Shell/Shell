@@ -215,6 +215,10 @@ pub fn help(_args: &[&str]) -> Result<()> {
         ("alias ls", "List aliases"),
         ("alias rm <alias>", "Remove an alias"),
         ("type <cmd>", "Show how a command resolves (also: which)"),
+        (
+            "aepkg <subcommand>",
+            "Manage packages (list, install, remove, reload)",
+        ),
         ("ver", "Show Ash version"),
         ("exit / quit", "Exit Ash"),
     ];
