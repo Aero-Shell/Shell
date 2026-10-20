@@ -2,7 +2,7 @@ use anyhow::Result;
 use rustyline::highlight::Highlighter;
 use rustyline::history::DefaultHistory;
 use rustyline::{CompletionType, Config as RLConfig, Editor};
-use shlex::split;
+use shlex;
 use std::borrow::Cow;
 use std::io::{IsTerminal, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -320,7 +320,11 @@ fn run_command_line(line: &str) -> Result<Option<i32>> {
         return Ok(Some(0));
     }
 
-    let parsed = parse_line(trimmed).and_then(|mut steps| unquote(&mut steps).map(|()| steps));
+    // Expand aliases on the raw line so that operators (`&&`, `||`, `|`,
+    // `;`, `<`, `>`) inside an alias body remain operators of the line,
+    // rather than literal arguments handed to the first command.
+    let line = expand_aliases_on_line(trimmed);
+    let parsed = parse_line(&line).and_then(|mut steps| unquote(&mut steps).map(|()| steps));
     let mut steps = match parsed {
         Ok(steps) => steps,
         Err(message) => {
@@ -331,8 +335,6 @@ fn run_command_line(line: &str) -> Result<Option<i32>> {
     if steps.is_empty() {
         return Ok(Some(0));
     }
-
-    expand_aliases(&mut steps);
 
     // Run the steps left to right: `&&` needs the previous status to be 0,
     // `||` needs it non-zero, `;` runs regardless. A skipped step leaves the
@@ -394,28 +396,266 @@ fn register_builtins() {
     register("aepkg", aepkg_cmd::aepkg);
 }
 
-// Expand aliases in the command word of every pipeline stage, one level deep.
-fn expand_aliases(steps: &mut [Step]) {
+// ---------------------------------------------------------------------------
+// Alias expansion on the raw line
+//
+// We expand aliases *before* parsing, on the raw command line, so that
+// operators (`&&`, `||`, `|`, `;`, `<`, `>`) that appear inside an alias
+// body remain operators of the line — not literal arguments handed to the
+// first command.  The body is spliced verbatim into the line and the shell's
+// own scanner re-tokenises the whole thing.
+//
+// We expand only in *command position* (the first word of each command),
+// matching every other shell: an alias name used as an ordinary argument is
+// not expanded.
+//
+// The old `alias create` builder re-quoted every token with `shlex::try_quote`,
+// which turned shell metacharacters like `&&` into quoted tokens (e.g.
+// `'&&'`) and thus destroyed their operator semantics.  Bodies created by that
+// builder are un-migrated at expansion time: quoted operators are turned back
+// into bare operators before the body is spliced in, so legacy aliases keep
+// working.
+//
+// Aliases created by the *new* builder are stored verbatim (the raw text the
+// user typed), so their operators already work without any migration.
+// ---------------------------------------------------------------------------
+
+/// Maximum recursive alias-expansion depth.  Recursion lets an alias whose
+// body refers to another alias be fully expanded, but we bound it to avoid
+// infinite loops on self-referencing aliases.
+const MAX_ALIAS_DEPTH: usize = 10;
+
+/// Expand the alias names of `line` into their stored bodies and return the
+// resulting line to parse.  Only command-position words are expanded; quoted
+// alias names are left alone; bodies are spliced verbatim and re-scanned.
+fn expand_aliases_on_line(line: &str) -> String {
+    expand_aliases_on_line_inner(line, 0)
+}
+
+fn expand_aliases_on_line_inner(line: &str, depth: usize) -> String {
+    // Bail out of recursion before we burn the stack on a self-referencing
+    // alias (e.g. `alias create x x`).
+    if depth >= MAX_ALIAS_DEPTH {
+        return line.to_string();
+    }
+
     let Ok(cfg) = config::active_config() else {
-        return;
+        return line.to_string();
     };
     if cfg.aliases.is_empty() {
-        return;
+        return line.to_string();
     }
-    for step in steps {
-        for stage in &mut step.stages {
-            let Some(first) = stage.words.first().cloned() else {
-                continue;
-            };
-            if let Some(value) = cfg.aliases.get(&first)
-                && let Some(replacement) = split(value)
-            {
-                let mut tokens = replacement;
-                tokens.extend(stage.words[1..].iter().cloned());
-                stage.words = tokens;
+
+    // Collect the bodies *before* we start mutating the output, so that
+    // recursive expansion sees a stable snapshot of the alias table.
+    let aliases: Vec<(String, String)> =
+        cfg.aliases.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+
+    let mut out = String::with_capacity(line.len());
+    let chars: Vec<char> = line.chars().collect();
+    let mut pos: usize = 0;
+    let mut in_command_position = true;
+
+    while pos < chars.len() {
+        let ch = chars[pos];
+
+        // Non-word bytes (whitespace, punctuation, operators, quotes,
+        // backticks, dollar signs, ...) are copied verbatim.  The scanner
+        // already handles these when it re-tokenises the expanded line, so
+        // we keep the original characters exactly.
+        if ch.is_ascii_whitespace()
+            || ch.is_ascii_punctuation()
+            || ch == '`'
+            || ch == '$'
+        {
+            out.push(ch);
+            if ch == ';' || ch == '|' || ch == '&' {
+                in_command_position = true;
+            } else if ch == '<' || ch == '>' {
+                in_command_position = false;
             }
+            pos += 1;
+            continue;
+        }
+
+        // A word: either quoted or unquoted.  Read the whole word (including
+        // its quotes, if any), then decide whether to expand it.
+        let (word, next_pos) = read_word(&chars, pos);
+        pos = next_pos;
+
+        if !in_command_position || word.starts_with('\'') || word.starts_with('"') {
+            // Active quotes prevent alias expansion in every shell.
+            out.push_str(&word);
+            in_command_position = false;
+            continue;
+        }
+
+        // Command position, unquoted word: try to expand it.
+        if let Some(body) = aliases.iter().find(|(name, _)| name == &word).map(|(_, b)| b.as_str())
+        {
+            // Un-migrate a legacy (re-quoted) body so its operators come back
+            // to life before we splice it in as raw text.
+            let unmigrated = unmigrate_stored_body(body);
+            let expanded_body = expand_aliases_on_line_inner(&unmigrated, depth + 1);
+            out.push_str(&expanded_body);
+            // After expanding, we consumed the word; the next word is still
+            // in command position if the body ended at a command separator,
+            // but we let the scanner decide once the line is re-parsed.
+            in_command_position = false;
+        } else {
+            out.push_str(&word);
+            in_command_position = false;
         }
     }
+
+    out
+}
+
+/// Read one word from `chars` starting at `pos`, returning the word text
+// (including surrounding quotes, if any) and the next index after the word.
+// Whitespace and metacharacters delimit the word.
+fn unmigrate_stored_body(body: &str) -> String {
+    let tokens = tokenize_stored_body(body);
+    tokens.join(" ")
+}
+
+fn tokenize_stored_body(body: &str) -> Vec<String> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if chars[i] == '\'' {
+            // Single-quoted token.
+            i += 1; // skip opening quote
+            let start = i;
+            while i < chars.len() && chars[i] != '\'' {
+                i += 1;
+            }
+            let content: String = chars[start..i].iter().collect();
+            if i < chars.len() {
+                i += 1; // skip closing quote
+            }
+            if is_operator_content(&content) {
+                tokens.push(content); // un-quote: bare operator
+            } else {
+                tokens.push(format!("'{}'", content)); // keep quoted
+            }
+        } else if chars[i] == '"' {
+            // Double-quoted token (rare in old stored bodies; keep quoted).
+            i += 1; // skip opening quote
+            let start = i;
+            while i < chars.len() && chars[i] != '"' {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    i += 2; // skip escaped char
+                } else {
+                    i += 1;
+                }
+            }
+            let content: String = chars[start..i].iter().collect();
+            if i < chars.len() {
+                i += 1; // skip closing quote
+            }
+            tokens.push(format!("\"{}\"", content));
+        } else {
+            // Unquoted token.
+            let start = i;
+            while i < chars.len() && !chars[i].is_whitespace() {
+                i += 1;
+            }
+            tokens.push(chars[start..i].iter().collect());
+        }
+    }
+    tokens
+}
+
+fn is_operator_content(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut has_operator = false;
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            continue;
+        }
+        if matches!(c, '|' | '&' | ';' | '<' | '>') {
+            has_operator = true;
+            continue;
+        }
+        return false;
+    }
+    has_operator
+}
+
+fn read_word(chars: &[char], mut pos: usize) -> (String, usize) {
+    if pos >= chars.len() {
+        return (String::new(), pos);
+    }
+
+    let (quoted, quote_ch) = match chars[pos] {
+        '\'' | '"' => (true, chars[pos]),
+        _ => (false, '\0'),
+    };
+
+    if !quoted {
+        // Unquoted word: read until whitespace/metacharacter/backslash-escape.
+        let start = pos;
+        while pos < chars.len() {
+            let ch = chars[pos];
+            if ch.is_ascii_whitespace()
+                || ch == '&'
+                || ch == '|'
+                || ch == ';'
+                || ch == '<'
+                || ch == '>'
+                || ch == '#'
+                || ch == '`'
+            {
+                break;
+            }
+            if ch == '\\' && pos + 1 < chars.len() {
+                // Backslash-escaped character: skip both bytes.
+                pos += 2;
+                continue;
+            }
+            pos += 1;
+        }
+        let word: String = chars[start..pos].iter().collect();
+        return (word, pos);
+    }
+
+    // Quoted word: read until the closing quote, preserving backslashes
+    // inside double quotes (they escape the next char), and preserving
+    // backslash-quote inside double quotes too.
+    let start = pos;
+    pos += 1; // skip opening quote
+    while pos < chars.len() {
+        let ch = chars[pos];
+        if ch == quote_ch {
+            pos += 1; // closing quote
+            break;
+        }
+        if ch == '\\' && quote_ch == '"' && pos + 1 < chars.len() {
+            // Inside double quotes: backslash escapes the next char.
+            pos += 2;
+            continue;
+        }
+        if ch == '\\' && quote_ch == '\'' && pos + 1 < chars.len() && chars[pos + 1] == '\'' {
+            // Inside single quotes: `\'` is valid in POSIX shells?
+            // Actually POSIX single quotes have no escapes.  But we keep
+            // the backslash so that the word is preserved verbatim for
+            // re-scanning, which matches what the old builder did.
+            pos += 2;
+            continue;
+        }
+        pos += 1;
+    }
+
+    let word: String = chars[start..pos].iter().collect();
+    (word, pos)
 }
 
 // ---------------------------------------------------------------------------
