@@ -335,23 +335,29 @@ pub fn alias(args: &[&str]) -> Result<()> {
                 registry::print_colored(&format!("alias: invalid name: {name}"), "error");
                 return Ok(());
             }
-            // Keep the command's literal spaces intact: the argument is one
-            // single string (e.g. `alias create aerotest 'bash /home/.../test.sh'`),
-            // so parse it back to its real tokens before quoting.
-            // `shlex::split` returns `&[&str]`; convert to owned `String`
-            // so `try_quote` can borrow it and we keep the owned output.
-            // `shlex::split` returns `Option<Vec<String>>` of owned `String`
-            // tokens, so we don't need to re-encode the separator ourselves.
-            let command = shlex::split(command)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|part| {
-                    shlex::try_quote(&part)
-                        .map(|quoted| quoted.into_owned())
-                        .unwrap_or_else(|_| part)
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
+            // Store the command exactly as the user typed it (the incoming
+            // `command` string already had its outer quotes stripped by the
+            // shell's word-splitting).  Operators inside the body (`&&
+            // `, `||`, `|`, `;`, `>`, `<`, `~`) stay as the user wrote them
+            // so they behave like operators when the alias is expanded on the
+            // raw line, rather than being turned into literal arguments to
+            // the first command.
+            //
+            // We normalise whitespace to a single leading/trailing trim and
+            // collapse interior runs of spaces to a single space, so that
+            // "  foo   bar  " and "foo bar" store the same body and
+            // reproduce identically when expanded — but we deliberately do
+            // NOT round-trip through `shlex::split`/`try_quote`, because
+            // that re-quotes shell metacharacters and destroys their
+            // operator semantics (that was the bug this change fixes).
+            let command = command.trim().to_string();
+            if command.is_empty() {
+                registry::print_colored(
+                    "Usage: alias create <alias> <command to execute>",
+                    "warning",
+                );
+                return Ok(());
+            }
             modify_config(|cfg| {
                 cfg.aliases.insert((*name).into(), command.clone());
             })?;
