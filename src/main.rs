@@ -314,9 +314,10 @@ fn main() -> Result<()> {
 // otherwise the status of the last command that ran.
 fn run_command_line(line: &str) -> Result<Option<i32>> {
     let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.starts_with('#') {
-        // Blank lines and `#` comments are no-ops. `scan` stops at an unquoted
-        // `#` that starts a word, so this only keeps the common case cheap.
+    if trimmed.is_empty() {
+        // Blank lines are no-ops. `scan` ends a `#` comment at its own
+        // newline, so a multi-line block that starts with a comment still
+        // runs the commands after it.
         return Ok(Some(0));
     }
 
@@ -469,7 +470,7 @@ fn expand_aliases_on_line_inner(line: &str, depth: usize) -> String {
             || ch == '$'
         {
             out.push(ch);
-            if ch == ';' || ch == '|' || ch == '&' {
+            if ch == ';' || ch == '|' || ch == '&' || ch == '\n' {
                 in_command_position = true;
             } else if ch == '<' || ch == '>' {
                 in_command_position = false;
@@ -777,6 +778,17 @@ fn scan(line: &str) -> Vec<Tok> {
                     word.push(ch);
                     i += 1;
                 }
+                '\\' if matches!(chars.get(i + 1), Some('\n' | '\r')) => {
+                    // Backslash-newline is a line continuation: drop it (and
+                    // a paired `\r` from a CRLF paste) so the command goes on
+                    // with the next line.
+                    i += if chars.get(i + 1) == Some(&'\r') && chars.get(i + 2) == Some(&'\n')
+                    {
+                        3
+                    } else {
+                        2
+                    };
+                }
                 '\\' if i + 1 < chars.len() => {
                     word.push(ch);
                     word.push(chars[i + 1]);
@@ -786,7 +798,29 @@ fn scan(line: &str) -> Vec<Tok> {
                     word.push(ch);
                     i += 1;
                 }
-                '#' if word.is_empty() => break,
+                '\n' => {
+                    // A newline ends the command, so pasted multi-line input
+                    // runs line by line. Blank lines and a newline right after
+                    // a separator are no-ops; a newline after `|`, `&&`, `||`
+                    // or a redirect keeps reading, so a pipeline may wrap.
+                    flush_word(&mut word, &mut toks);
+                    let continues = match toks.last() {
+                        None | Some(Tok::Semi | Tok::Pipe | Tok::And | Tok::Or) => true,
+                        Some(Tok::Redir(kind)) => kind.takes_target(),
+                        Some(Tok::Word(_)) => false,
+                    };
+                    if !continues {
+                        toks.push(Tok::Semi);
+                    }
+                    i += 1;
+                }
+                '#' if word.is_empty() => {
+                    // A comment runs to the end of its line only; the newline
+                    // arm then separates it from the next command.
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                }
                 c if c.is_whitespace() => {
                     flush_word(&mut word, &mut toks);
                     i += 1;
@@ -1449,4 +1483,65 @@ fn set_default_shell() -> Result<()> {
 
     println!("Default shell is now {exe}. Log out and back in to use it.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Parse `line` and return the words of every stage, in order.
+    fn stages(line: &str) -> Vec<Vec<String>> {
+        let mut steps = parse_line(line).unwrap_or_else(|e| panic!("{line:?}: {e}"));
+        unquote(&mut steps).unwrap_or_else(|e| panic!("{line:?}: {e}"));
+        steps
+            .into_iter()
+            .flat_map(|step| step.stages)
+            .map(|stage| stage.words)
+            .collect()
+    }
+
+    fn words(line: &str) -> Vec<String> {
+        stages(line)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<String>>()
+    }
+
+    #[test]
+    fn newline_separates_commands() {
+        assert_eq!(
+            stages("echo one\necho two"),
+            vec![vec!["echo", "one"], vec!["echo", "two"]]
+        );
+        // A trailing newline and blank lines don't add empty commands.
+        assert_eq!(stages("echo one\n\n\necho two\n").len(), 2);
+        assert_eq!(stages("echo one\r\necho two\r\n").len(), 2);
+        assert_eq!(words("echo one\n"), vec!["echo", "one"]);
+    }
+
+    #[test]
+    fn backslash_newline_continues_the_command() {
+        assert_eq!(words("echo a \\\nb"), vec!["echo", "a", "b"]);
+        assert_eq!(words("echo a \\\r\nb"), vec!["echo", "a", "b"]);
+    }
+
+    #[test]
+    fn a_wrapped_pipeline_stays_one_pipeline() {
+        let steps = stages("cat /etc/os-release |\n  head -1");
+        assert_eq!(steps, vec![vec!["cat", "/etc/os-release"], vec!["head", "-1"]]);
+        assert_eq!(stages("echo a &&\necho b").len(), 2);
+    }
+
+    #[test]
+    fn a_comment_ends_at_its_own_newline() {
+        assert_eq!(
+            stages("# install it\necho one # trailing\necho two"),
+            vec![vec!["echo", "one"], vec!["echo", "two"]]
+        );
+    }
+
+    #[test]
+    fn newlines_inside_quotes_are_kept() {
+        assert_eq!(words("echo \"a\nb\""), vec!["echo", "a\nb"]);
+    }
 }
