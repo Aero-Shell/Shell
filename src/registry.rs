@@ -60,3 +60,49 @@ pub fn colorize(text: &str, key: &str) -> String {
 pub fn active_config() -> anyhow::Result<config::Config> {
     config::active_config()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probe(_args: &[&str]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[test]
+    fn register_resolve_and_unregister_round_trip() {
+        register("test_probe_command", probe);
+        assert!(resolve("test_probe_command").is_some());
+        unregister("test_probe_command");
+        assert!(resolve("test_probe_command").is_none());
+    }
+
+    #[test]
+    fn unknown_commands_do_not_resolve() {
+        assert!(resolve("test_probe_missing_command").is_none());
+    }
+
+    #[test]
+    fn names_are_sorted_and_include_registered_commands() {
+        register("test_probe_zeta", probe);
+        register("test_probe_alpha", probe);
+        let names = names();
+        assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(names.contains(&"test_probe_zeta".to_string()));
+        assert!(names.contains(&"test_probe_alpha".to_string()));
+        unregister("test_probe_zeta");
+        unregister("test_probe_alpha");
+    }
+
+    #[test]
+    fn re_registering_replaces_the_handler() {
+        register_handler("test_probe_replace", |_| anyhow::bail!("first"));
+        let first = resolve("test_probe_replace").expect("registered");
+        assert!(first(&[]).is_err());
+
+        register_handler("test_probe_replace", |_| Ok(()));
+        let second = resolve("test_probe_replace").expect("registered");
+        assert!(second(&[]).is_ok());
+        unregister("test_probe_replace");
+    }
+}

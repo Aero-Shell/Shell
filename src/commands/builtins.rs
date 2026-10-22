@@ -195,46 +195,86 @@ pub fn ver(_args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+// One `help` row. A command that has subcommands keeps them here so they are
+// listed once, nested under the command, instead of as duplicate top-level
+// entries (that is what `alias create`/`ls`/`rm` used to be).
+struct HelpEntry {
+    usage: &'static str,
+    summary: &'static str,
+    subcommands: &'static [(&'static str, &'static str)],
+}
+
+const fn cmd(usage: &'static str, summary: &'static str) -> HelpEntry {
+    HelpEntry {
+        usage,
+        summary,
+        subcommands: &[],
+    }
+}
+
+const HELP: &[HelpEntry] = &[
+    cmd(
+        "ls [--show-hidden] [dir]",
+        "List files in columns (dotfiles hidden unless --show-hidden)",
+    ),
+    cmd(
+        "cd [dir]",
+        "Change directory ('-' = previous, '~' = home)",
+    ),
+    cmd("pwd", "Print working directory"),
+    cmd("history [n]", "Show recent commands (last n)"),
+    cmd("export VAR=val", "Set a session environment variable"),
+    cmd("unset VAR", "Remove a session environment variable"),
+    HelpEntry {
+        usage: "alias <subcommand>",
+        summary: "Create, list or remove persistent aliases",
+        subcommands: &[
+            (
+                "create <alias> <command…>",
+                "Create a persistent command alias",
+            ),
+            ("ls", "List aliases"),
+            ("rm <alias>", "Remove an alias"),
+        ],
+    },
+    cmd(
+        "type <cmd>",
+        "Show how a command resolves (also: which)",
+    ),
+    cmd(
+        "help [cmd]",
+        "Show help; with a command, tell you how to get its help",
+    ),
+    cmd(
+        "aepkg <subcommand>",
+        "Manage packages (list, install, remove, reload)",
+    ),
+    cmd("ver", "Show Ash version"),
+    cmd("exit / quit", "Exit Ash"),
+];
+
+// Rows are indented two spaces per level; the usage column narrows by the same
+// amount so every `-` stays in one column, subcommands included.
+fn help_lines() -> Vec<String> {
+    let mut lines = Vec::new();
+    for entry in HELP {
+        lines.push(format!("  {:<34} - {}", entry.usage, entry.summary));
+        for (usage, summary) in entry.subcommands {
+            lines.push(format!("    {:<32} - {summary}", usage));
+        }
+    }
+    lines
+}
+
 pub fn help(args: &[&str]) -> Result<()> {
     if let Some(name) = args.first() {
         return help_one(name);
     }
 
     registry::print_colored("Ash Help - Available Commands:", "header");
-
-    let help_text = [
-        (
-            "ls [--show-hidden] [dir]",
-            "List files in columns (dotfiles hidden unless --show-hidden)",
-        ),
-        ("cd [dir]", "Change directory ('-' = previous, '~' = home)"),
-        ("pwd", "Print working directory"),
-        ("history [n]", "Show recent commands (last n)"),
-        ("export VAR=val", "Set a session environment variable"),
-        ("unset VAR", "Remove a session environment variable"),
-        (
-            "alias create <alias> <command…>",
-            "Create a persistent command alias",
-        ),
-        ("alias ls", "List aliases"),
-        ("alias rm <alias>", "Remove an alias"),
-        ("type <cmd>", "Show how a command resolves (also: which)"),
-        (
-            "help [cmd]",
-            "Show help; with a command, tell you how to get its help",
-        ),
-        (
-            "aepkg <subcommand>",
-            "Manage packages (list, install, remove, reload)",
-        ),
-        ("ver", "Show Ash version"),
-        ("exit / quit", "Exit Ash"),
-    ];
-
-    for (cmd, desc) in help_text {
-        println!("  {cmd:<34} - {desc}");
+    for line in help_lines() {
+        println!("{line}");
     }
-
     Ok(())
 }
 
@@ -549,4 +589,109 @@ fn modify_config(f: impl FnOnce(&mut config::Config)) -> anyhow::Result<()> {
     config::save_config(&cfg)?;
     config::set_config(cfg);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alias_is_one_entry_with_nested_subcommands() {
+        let lines = help_lines();
+        let top_level: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.starts_with("  ") && !line.starts_with("    "))
+            .collect();
+        let aliases: Vec<&&String> = top_level
+            .iter()
+            .filter(|line| line.trim_start().starts_with("alias "))
+            .collect();
+        assert_eq!(aliases.len(), 1, "alias should be a single entry: {lines:#?}");
+        assert!(aliases[0].trim_start().starts_with("alias <subcommand>"));
+
+        let start = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("alias <subcommand>"))
+            .expect("alias row missing");
+        let nested = &lines[start + 1..start + 4];
+        for (line, usage) in nested.iter().zip([
+            "create <alias> <command…>",
+            "ls",
+            "rm <alias>",
+        ]) {
+            assert!(line.starts_with("    "), "not nested: {line:?}");
+            assert!(
+                line.trim_start().starts_with(usage),
+                "expected {usage:?} in {line:?}"
+            );
+            assert!(
+                line.contains(" - "),
+                "missing description on help row: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_names_start_with_a_letter_or_underscore() {
+        for name in ["a", "_x", "foo_bar", "A1", "alias2"] {
+            assert!(is_valid_name(name), "{name} should be valid");
+        }
+        for name in ["", "1a", "a-b", "a b", "a.b", "ünïcode"] {
+            assert!(!is_valid_name(name), "{name} should be invalid");
+        }
+    }
+
+    #[test]
+    fn help_columns_align_at_every_level() {
+        let lines = help_lines();
+        // Count characters, not bytes: rows may contain multibyte text like
+        // the `…` in `create <alias> <command…>`.
+        let columns: Vec<usize> = lines
+            .iter()
+            .map(|line| {
+                let at = line.find(" - ").expect("help row without a separator");
+                line[..at].chars().count()
+            })
+            .collect();
+        assert!(
+            columns.windows(2).all(|pair| pair[0] == pair[1]),
+            "misaligned help columns: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn every_help_row_has_a_usage_and_a_summary() {
+        for line in help_lines() {
+            let (usage, summary) = line
+                .split_once(" - ")
+                .expect("help row without a separator");
+            assert!(!usage.trim().is_empty(), "empty usage in {line:?}");
+            assert!(!summary.trim().is_empty(), "empty summary in {line:?}");
+        }
+    }
+
+    #[test]
+    fn tilde_expands_to_the_home_directory() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/docs/x"), home.join("docs/x"));
+    }
+
+    #[test]
+    fn other_paths_are_left_alone() {
+        assert_eq!(expand_tilde("/tmp/x"), PathBuf::from("/tmp/x"));
+        assert_eq!(expand_tilde("rel/x"), PathBuf::from("rel/x"));
+        assert_eq!(expand_tilde("~user/x"), PathBuf::from("~user/x"));
+        assert_eq!(expand_tilde("a~b"), PathBuf::from("a~b"));
+    }
+
+    #[test]
+    fn completion_candidates_are_quoted_only_when_needed() {
+        assert_eq!(quote_if_needed("plain.txt"), "plain.txt");
+        let quoted = quote_if_needed("two words.txt");
+        assert_ne!(quoted, "two words.txt");
+        assert_eq!(shlex::split(&quoted).unwrap(), vec!["two words.txt"]);
+    }
 }
