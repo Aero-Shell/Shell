@@ -87,9 +87,7 @@ Built-in commands (also listed by `help`):
 | `history [n]` | Show recent commands (last n) |
 | `export VAR=val` | Set a session environment variable |
 | `unset VAR` | Remove a session environment variable |
-| `alias create <alias> <command…>` | Create a persistent alias |
-| `alias ls` | List aliases |
-| `alias rm <alias>` | Remove an alias |
+| `alias <subcommand>` | Manage aliases: `create <alias> <command…>`, `ls`, `rm <alias>` |
 | `type <cmd>` / `which <cmd>` | Show how a command resolves |
 | `aepkg <subcommand>` | Manage packages (`list`, `install`, `remove`, `reload`, …) |
 | `ver` | Show Ash version |
