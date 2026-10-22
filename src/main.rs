@@ -1714,3 +1714,247 @@ fn set_default_shell() -> Result<()> {
     println!("Default shell is now {exe}. Log out and back in to use it.");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    // Parse `line` fully (quotes removed) and return the words of each stage.
+    fn stages(line: &str) -> Vec<Vec<String>> {
+        let mut steps = parse_line(line).unwrap_or_else(|e| panic!("{line:?}: {e}"));
+        unquote(&mut steps).unwrap_or_else(|e| panic!("{line:?}: {e}"));
+        steps
+            .into_iter()
+            .flat_map(|step| step.stages)
+            .map(|stage| stage.words)
+            .collect()
+    }
+
+    fn words(line: &str) -> Vec<String> {
+        stages(line).into_iter().flatten().collect()
+    }
+
+    fn step_count(line: &str) -> usize {
+        parse_line(line)
+            .unwrap_or_else(|e| panic!("{line:?}: {e}"))
+            .len()
+    }
+
+    fn parse_error(line: &str) -> String {
+        parse_line(line)
+            .err()
+            .unwrap_or_else(|| panic!("{line:?} should not parse"))
+    }
+
+    fn unquote_error(line: &str) -> String {
+        let mut steps = parse_line(line).unwrap_or_else(|e| panic!("{line:?}: {e}"));
+        unquote(&mut steps)
+            .err()
+            .unwrap_or_else(|| panic!("{line:?} should not unquote"))
+    }
+
+    fn joins(line: &str) -> Vec<&'static str> {
+        parse_line(line)
+            .unwrap_or_else(|e| panic!("{line:?}: {e}"))
+            .iter()
+            .map(|step| match step.join {
+                Some(Join::And) => "&&",
+                Some(Join::Or) => "||",
+                Some(Join::Semi) => ";",
+                None => "end",
+            })
+            .collect()
+    }
+
+    fn redirs(line: &str) -> Vec<(&'static str, String)> {
+        let mut steps = parse_line(line).unwrap_or_else(|e| panic!("{line:?}: {e}"));
+        unquote(&mut steps).unwrap_or_else(|e| panic!("{line:?}: {e}"));
+        steps
+            .into_iter()
+            .flat_map(|step| step.stages)
+            .flat_map(|stage| stage.redirs)
+            .map(|redir| (redir.kind.token(), redir.target))
+            .collect()
+    }
+
+    fn command_arg(args: &[&str]) -> Option<String> {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_args(&owned)
+            .unwrap_or_else(|e| panic!("{args:?}: {e:#}"))
+            .and_then(|shell| shell.command)
+    }
+
+    fn args_error(args: &[&str]) -> bool {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_args(&owned).is_err()
+    }
+
+    #[test]
+    fn a_simple_command_splits_into_words() {
+        assert_eq!(words("ls -la /tmp"), v(&["ls", "-la", "/tmp"]));
+        assert_eq!(stages("ls -la /tmp").len(), 1);
+    }
+
+    #[test]
+    fn quotes_group_words_and_are_removed() {
+        assert_eq!(
+            words(r#"echo "hello world" 'second arg'"#),
+            v(&["echo", "hello world", "second arg"])
+        );
+    }
+
+    #[test]
+    fn backslash_escapes_stay_inside_one_word() {
+        assert_eq!(words(r"echo hello\ world"), v(&["echo", "hello world"]));
+        assert_eq!(words(r#"echo "a\"b""#), v(&["echo", "a\"b"]));
+    }
+
+    #[test]
+    fn unmatched_quotes_are_reported() {
+        assert_eq!(
+            unquote_error(r#"echo "oops"#),
+            "ash: syntax error: unmatched quote"
+        );
+        assert_eq!(
+            unquote_error("echo 'oops"),
+            "ash: syntax error: unmatched quote"
+        );
+    }
+
+    #[test]
+    fn pipelines_stay_in_one_step() {
+        assert_eq!(stages("cat f | grep x | head -1").len(), 3);
+        assert_eq!(step_count("cat f | grep x"), 1);
+        assert_eq!(joins("cat f | grep x"), vec!["end"]);
+    }
+
+    #[test]
+    fn sequencing_splits_steps_and_records_the_join() {
+        assert_eq!(step_count("a && b || c ; d"), 4);
+        assert_eq!(joins("a && b || c ; d"), vec!["&&", "||", ";", "end"]);
+    }
+
+    #[test]
+    fn trailing_semicolons_and_blank_lines() {
+        assert_eq!(step_count("echo a;"), 1);
+        assert_eq!(step_count("   "), 0);
+        assert_eq!(step_count("\t\n"), 0);
+    }
+
+    #[test]
+    fn missing_commands_around_operators_are_syntax_errors() {
+        assert_eq!(parse_error("| cat"), syntax_error("|"));
+        assert_eq!(parse_error("cat |"), syntax_error("|"));
+        assert_eq!(parse_error("a &&"), syntax_error("&&"));
+        assert_eq!(parse_error("a ||"), syntax_error("||"));
+        assert_eq!(parse_error("a ;; b"), syntax_error(";"));
+    }
+
+    #[test]
+    fn redirections_keep_their_kind_and_target() {
+        assert_eq!(
+            redirs("echo hi > out.txt 2>> err.txt < in.txt &> all.txt"),
+            vec![
+                (">", "out.txt".to_string()),
+                ("2>>", "err.txt".to_string()),
+                ("<", "in.txt".to_string()),
+                ("&>", "all.txt".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn descriptor_duplication_takes_no_file() {
+        assert_eq!(redirs("cmd 2>&1"), vec![(">&", String::new())]);
+        assert_eq!(words("cmd 2>&1"), v(&["cmd"]));
+    }
+
+    #[test]
+    fn redirect_targets_are_unquoted() {
+        assert_eq!(
+            redirs(r#"echo hi > "my file.txt""#),
+            vec![(">", "my file.txt".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_redirect_without_a_file_is_a_syntax_error() {
+        assert_eq!(parse_error("echo hi >"), syntax_error(">"));
+        assert_eq!(parse_error("echo hi 2>"), syntax_error("2>"));
+        assert_eq!(parse_error("echo hi <"), syntax_error("<"));
+    }
+
+    #[test]
+    fn a_comment_ends_the_line_but_not_a_word() {
+        assert_eq!(words("echo a # trailing"), v(&["echo", "a"]));
+        assert_eq!(step_count("# only a comment"), 0);
+        assert_eq!(words("echo a#b"), v(&["echo", "a#b"]));
+        assert_eq!(words(r#"echo "a # b""#), v(&["echo", "a # b"]));
+        assert_eq!(words(r"echo a\#b"), v(&["echo", "a#b"]));
+    }
+
+    #[test]
+    fn read_word_stops_at_metacharacters_and_keeps_quotes() {
+        let chars: Vec<char> = "foo|bar".chars().collect();
+        assert_eq!(read_word(&chars, 0), ("foo".to_string(), 3));
+        let quoted: Vec<char> = r#""a b" tail"#.chars().collect();
+        assert_eq!(read_word(&quoted, 0), (r#""a b""#.to_string(), 5));
+    }
+
+    #[test]
+    fn stored_bodies_keep_quotes_except_for_operators() {
+        assert_eq!(
+            tokenize_stored_body("ls -la '&&' x"),
+            vec!["ls", "-la", "&&", "x"]
+        );
+        assert_eq!(tokenize_stored_body("'echo hi'"), vec!["'echo hi'"]);
+        assert_eq!(
+            unmigrate_stored_body("'echo' 'a' '&&' 'echo' 'b'"),
+            "'echo' 'a' && 'echo' 'b'"
+        );
+        assert!(is_operator_content("2>&1"));
+        assert!(is_operator_content("&&"));
+        assert!(!is_operator_content("ls"));
+        assert!(!is_operator_content(""));
+    }
+
+    #[test]
+    fn parse_args_reads_the_c_flag_in_its_forms() {
+        assert_eq!(
+            command_arg(&["-c", "echo hi"]),
+            Some("echo hi".to_string())
+        );
+        assert_eq!(command_arg(&["-lc", "ls"]), Some("ls".to_string()));
+        assert_eq!(command_arg(&["-cecho hi"]), Some("echo hi".to_string()));
+        assert_eq!(command_arg(&["-il"]), None);
+        assert_eq!(command_arg(&["-"]), None);
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_flags_and_missing_c_arguments() {
+        assert!(args_error(&["--bogus"]));
+        assert!(args_error(&["file.txt"]));
+        assert!(args_error(&["-c"]));
+    }
+
+    fn with_join(join: Option<Join>) -> Step {
+        Step {
+            stages: Vec::new(),
+            join,
+        }
+    }
+
+    #[test]
+    fn step_runs_after_honours_and_or_and_semicolon() {
+        assert!(step_runs_after(&with_join(Some(Join::And)), 0));
+        assert!(!step_runs_after(&with_join(Some(Join::And)), 1));
+        assert!(step_runs_after(&with_join(Some(Join::Or)), 1));
+        assert!(!step_runs_after(&with_join(Some(Join::Or)), 0));
+        assert!(step_runs_after(&with_join(Some(Join::Semi)), 1));
+        assert!(step_runs_after(&with_join(None), 1));
+    }
+}
