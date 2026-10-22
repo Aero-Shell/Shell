@@ -751,6 +751,9 @@ fn scan(line: &str) -> Vec<Tok> {
     let mut toks: Vec<Tok> = Vec::new();
     let mut word = String::new();
     let mut quote: Option<char> = None;
+    // Whether the line ended in a `#` comment, which must not let the next
+    // line satisfy a redirect that was still waiting for its file.
+    let mut commented = false;
     let mut i = 0;
 
     while i < chars.len() {
@@ -804,11 +807,21 @@ fn scan(line: &str) -> Vec<Tok> {
                     // a separator are no-ops; a newline after `|`, `&&`, `||`
                     // or a redirect keeps reading, so a pipeline may wrap.
                     flush_word(&mut word, &mut toks);
+                    // A comment can eat a redirect's file. The redirect is
+                    // then dangling, so input ends here and reports the
+                    // redirect error instead of taking the next line's first
+                    // word as its target.
+                    if commented
+                        && matches!(toks.last(), Some(Tok::Redir(kind)) if kind.takes_target())
+                    {
+                        break;
+                    }
                     let continues = match toks.last() {
                         None | Some(Tok::Semi | Tok::Pipe | Tok::And | Tok::Or) => true,
                         Some(Tok::Redir(kind)) => kind.takes_target(),
                         Some(Tok::Word(_)) => false,
                     };
+                    commented = false;
                     if !continues {
                         toks.push(Tok::Semi);
                     }
@@ -817,6 +830,7 @@ fn scan(line: &str) -> Vec<Tok> {
                 '#' if word.is_empty() => {
                     // A comment runs to the end of its line only; the newline
                     // arm then separates it from the next command.
+                    commented = true;
                     while i < chars.len() && chars[i] != '\n' {
                         i += 1;
                     }
@@ -1538,6 +1552,24 @@ mod tests {
             stages("# install it\necho one # trailing\necho two"),
             vec![vec!["echo", "one"], vec!["echo", "two"]]
         );
+        // A comment after a pipe or `&&` still lets the next line continue it.
+        assert_eq!(
+            stages("echo a | # c\n  tr a-z A-Z"),
+            vec![vec!["echo", "a"], vec!["tr", "a-z", "A-Z"]]
+        );
+    }
+
+    #[test]
+    fn a_comment_after_a_redirect_is_a_syntax_error() {
+        // The comment consumes the redirect's file, so the next line must not
+        // become its target (`echo a > b` would silently write a file).
+        let error = parse_line("echo a > # c\necho b")
+            .err()
+            .expect("a comment-eaten redirect must be a syntax error");
+        assert_eq!(error, syntax_error(">"));
+        assert!(parse_line("echo a 2>> # c\necho b").is_err());
+        // A descriptor duplicate needs no target, so the next line runs.
+        assert_eq!(stages("echo a 2>&1 # c\necho b").len(), 2);
     }
 
     #[test]
