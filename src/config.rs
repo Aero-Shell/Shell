@@ -551,3 +551,102 @@ pub fn default_prompt_template() -> String {
 pub fn aero_version() -> String {
     env!("CARGO_PKG_VERSION").into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standard_ansi_knows_names_aliases_and_unknowns() {
+        assert_eq!(standard_ansi("red"), Some("\x1b[31m"));
+        assert_eq!(standard_ansi("aqua"), standard_ansi("cyan"));
+        assert_eq!(standard_ansi("bold"), Some("\x1b[1m"));
+        assert_eq!(standard_ansi("no-such-color"), None);
+    }
+
+    #[test]
+    fn default_config_has_colors_a_prompt_and_no_aliases() {
+        let cfg = Config::default_template();
+        assert!(cfg.color);
+        assert_eq!(cfg.time_format, "24");
+        assert_eq!(cfg.active_theme, "default");
+        assert!(cfg.aliases.is_empty());
+        for key in [
+            "reset",
+            "error",
+            "success",
+            "warning",
+            "header",
+            "ls_dir",
+            "ls_file",
+            "ls_script",
+            "bold",
+        ] {
+            assert!(cfg.colors.contains_key(key), "missing color {key}");
+        }
+        assert!(cfg.prompt_template.contains("{hostname}"));
+        assert!(cfg.prompt_template.contains("{pwd}"));
+        assert_eq!(cfg.prompt_template, default_prompt_template());
+    }
+
+    #[test]
+    fn prompt_context_replaces_color_tags_with_codes() {
+        let ctx = PromptContext::new(&Config::default_template());
+        assert_eq!(ctx.render("<red>X</red>"), "\x1b[31mX\x1b[0m");
+    }
+
+    #[test]
+    fn prompt_context_falls_back_to_standard_ansi() {
+        let mut cfg = Config::default_template();
+        cfg.colors.remove("red");
+        let ctx = PromptContext::new(&cfg);
+        assert_eq!(ctx.render("<red>X</red>"), "\x1b[31mX\x1b[0m");
+    }
+
+    #[test]
+    fn prompt_context_leaves_unknown_tags_alone() {
+        let ctx = PromptContext::new(&Config::default_template());
+        assert_eq!(
+            ctx.render("<notacolor>x</notacolor>"),
+            "<notacolor>x</notacolor>"
+        );
+    }
+
+    #[test]
+    fn prompt_context_substitutes_placeholders() {
+        let ctx = PromptContext::new(&Config::default_template());
+        let rendered = ctx.render("{username}@{hostname}");
+        assert!(rendered.starts_with("Aero-User@"), "{rendered:?}");
+        assert!(!rendered.contains("{username}"));
+        if let Ok(pwd) = std::env::current_dir() {
+            assert_eq!(ctx.render("{pwd}"), pwd.to_string_lossy());
+        }
+    }
+
+    #[test]
+    fn palette_groups_are_stable() {
+        let palette = get_palette();
+        let names: Vec<&str> = palette.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["core", "data", "format"]);
+        assert!(palette[0].1.contains(&"reset".to_string()));
+        assert!(palette[2].1.contains(&"bold".to_string()));
+    }
+
+    #[test]
+    fn data_dir_prefers_an_existing_config() {
+        let base = std::env::temp_dir().join(format!("ash-config-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        assert_eq!(env_proxy_dir(&base).unwrap(), base.join(".aeroshell"));
+
+        std::fs::create_dir_all(base.join(".aero")).unwrap();
+        std::fs::write(base.join(".aero/config.json"), "{}").unwrap();
+        assert_eq!(env_proxy_dir(&base).unwrap(), base.join(".aero"));
+
+        std::fs::create_dir_all(base.join(".aeroshell")).unwrap();
+        std::fs::write(base.join(".aeroshell/config.json"), "{}").unwrap();
+        assert_eq!(env_proxy_dir(&base).unwrap(), base.join(".aeroshell"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}

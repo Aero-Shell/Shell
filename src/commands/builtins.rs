@@ -632,6 +632,16 @@ mod tests {
     }
 
     #[test]
+    fn valid_names_start_with_a_letter_or_underscore() {
+        for name in ["a", "_x", "foo_bar", "A1", "alias2"] {
+            assert!(is_valid_name(name), "{name} should be valid");
+        }
+        for name in ["", "1a", "a-b", "a b", "a.b", "ünïcode"] {
+            assert!(!is_valid_name(name), "{name} should be invalid");
+        }
+    }
+
+    #[test]
     fn help_columns_align_at_every_level() {
         let lines = help_lines();
         // Count characters, not bytes: rows may contain multibyte text like
@@ -658,5 +668,30 @@ mod tests {
             assert!(!usage.trim().is_empty(), "empty usage in {line:?}");
             assert!(!summary.trim().is_empty(), "empty summary in {line:?}");
         }
+    }
+
+    #[test]
+    fn tilde_expands_to_the_home_directory() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/docs/x"), home.join("docs/x"));
+    }
+
+    #[test]
+    fn other_paths_are_left_alone() {
+        assert_eq!(expand_tilde("/tmp/x"), PathBuf::from("/tmp/x"));
+        assert_eq!(expand_tilde("rel/x"), PathBuf::from("rel/x"));
+        assert_eq!(expand_tilde("~user/x"), PathBuf::from("~user/x"));
+        assert_eq!(expand_tilde("a~b"), PathBuf::from("a~b"));
+    }
+
+    #[test]
+    fn completion_candidates_are_quoted_only_when_needed() {
+        assert_eq!(quote_if_needed("plain.txt"), "plain.txt");
+        let quoted = quote_if_needed("two words.txt");
+        assert_ne!(quoted, "two words.txt");
+        assert_eq!(shlex::split(&quoted).unwrap(), vec!["two words.txt"]);
     }
 }

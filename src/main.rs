@@ -275,14 +275,8 @@ fn main() -> Result<()> {
         let template = config_guard.prompt_template.clone();
         let prompt = config::format_prompt(&template);
 
-        let line = match rl.readline(&prompt) {
-            Ok(l) => {
-                rl.add_history_entry(&l).ok();
-                if let Ok(path) = config::history_path() {
-                    let _ = rl.append_history(&path);
-                }
-                l
-            }
+        let mut line = match rl.readline(&prompt) {
+            Ok(l) => l,
             Err(rustyline::error::ReadlineError::Interrupted) => continue,
             Err(rustyline::error::ReadlineError::Eof) => {
                 // Ctrl-D is normal here; EOF from a closed pipe ends input.
@@ -295,6 +289,40 @@ fn main() -> Result<()> {
                 return Err(e.into());
             }
         };
+
+        // An opened heredoc is read from the following lines, up to its
+        // delimiter. Keep asking for them here so the command and its body
+        // reach the parser together; Ctrl-C or Ctrl-D cancels the heredoc.
+        let mut cancelled = false;
+        while let Err(HereDocError::Unterminated(delimiter)) = split_heredocs(&line) {
+            let continuation = config::colorize("> ", "green");
+            match rl.readline(&continuation) {
+                Ok(more) => {
+                    line.push('\n');
+                    line.push_str(&more);
+                }
+                Err(rustyline::error::ReadlineError::Interrupted)
+                | Err(rustyline::error::ReadlineError::Eof) => {
+                    registry::print_colored(
+                        &format!("ash: heredoc '{delimiter}' cancelled"),
+                        "warning",
+                    );
+                    cancelled = true;
+                    break;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if cancelled {
+            continue;
+        }
+
+        if !line.trim().is_empty() {
+            rl.add_history_entry(&line).ok();
+            if let Ok(path) = config::history_path() {
+                let _ = rl.append_history(&path);
+            }
+        }
 
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -310,9 +338,39 @@ fn main() -> Result<()> {
 }
 
 // Run one command line: pipelines joined by `&&`, `||` and `;`, with each
-// stage's redirections applied. Returns Ok(None) when the line was exit/quit,
-// otherwise the status of the last command that ran.
+// stage's redirections applied. Heredoc bodies are read from the lines that
+// follow the command, and anything after the last delimiter runs in turn.
+// Returns Ok(None) when the line was exit/quit, otherwise the status of the
+// last command that ran.
 fn run_command_line(line: &str) -> Result<Option<i32>> {
+    let mut text = line.to_string();
+    loop {
+        let (command_line, bodies, leftover) = match split_heredocs(&text) {
+            Ok(parts) => parts,
+            Err(HereDocError::Unterminated(delimiter)) => {
+                registry::print_colored(
+                    &format!("ash: syntax error: unterminated heredoc '{delimiter}'"),
+                    "error",
+                );
+                return Ok(Some(2));
+            }
+            Err(HereDocError::Syntax(message)) => {
+                registry::print_colored(&message, "error");
+                return Ok(Some(2));
+            }
+        };
+        let status = match run_single_command_line(&command_line, bodies)? {
+            Some(code) => code,
+            None => return Ok(None), // exit/quit
+        };
+        match leftover {
+            Some(rest) if !rest.trim().is_empty() => text = rest,
+            _ => return Ok(Some(status)),
+        }
+    }
+}
+
+fn run_single_command_line(line: &str, bodies: Vec<String>) -> Result<Option<i32>> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
         // Blank lines and `#` comments are no-ops. `scan` stops at an unquoted
@@ -324,8 +382,12 @@ fn run_command_line(line: &str) -> Result<Option<i32>> {
     // `;`, `<`, `>`) inside an alias body remain operators of the line,
     // rather than literal arguments handed to the first command.
     let line = expand_aliases_on_line(trimmed);
-    let parsed = parse_line(&line).and_then(|mut steps| unquote(&mut steps).map(|()| steps));
-    let mut steps = match parsed {
+    let parsed = parse_line(&line).and_then(|mut steps| {
+        unquote(&mut steps)?;
+        attach_heredocs(&mut steps, bodies)?;
+        Ok(steps)
+    });
+    let steps = match parsed {
         Ok(steps) => steps,
         Err(message) => {
             registry::print_colored(&message, "error");
@@ -686,6 +748,7 @@ enum RedirKind {
     ErrAppend,                  // 2>> file
     OutErr,                     // &> file
     Dup { fd: i32, from: i32 }, // 2>&1 (takes no target word)
+    HereDoc,                    // << word / <<- word (body collected separately)
 }
 
 impl RedirKind {
@@ -699,6 +762,7 @@ impl RedirKind {
             RedirKind::ErrAppend => "2>>",
             RedirKind::OutErr => "&>",
             RedirKind::Dup { .. } => ">&",
+            RedirKind::HereDoc => "<<",
         }
     }
 
@@ -711,6 +775,8 @@ impl RedirKind {
 struct Redir {
     kind: RedirKind,
     target: String,
+    // Heredoc input, filled in once the body lines have been read.
+    body: String,
 }
 
 #[derive(Default)]
@@ -821,8 +887,17 @@ fn scan(line: &str) -> Vec<Tok> {
                 }
                 '<' => {
                     flush_word(&mut word, &mut toks);
-                    toks.push(Tok::Redir(RedirKind::In));
-                    i += 1;
+                    if chars.get(i + 1) == Some(&'<') {
+                        // `<<-` strips leading tabs from the body; `<<` keeps
+                        // them. The delimiter is the next word, taken by the
+                        // parser like a redirect target.
+                        let strip_tabs = chars.get(i + 2) == Some(&'-');
+                        toks.push(Tok::Redir(RedirKind::HereDoc));
+                        i += if strip_tabs { 3 } else { 2 };
+                    } else {
+                        toks.push(Tok::Redir(RedirKind::In));
+                        i += 1;
+                    }
                 }
                 '>' => {
                     flush_word(&mut word, &mut toks);
@@ -899,6 +974,164 @@ fn tok_name(tok: &Tok) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Heredocs (`<< 'EOF'`, `<<-EOF`)
+//
+// A heredoc's body is not part of its command line: it is read from the lines
+// that follow, up to the delimiter line. `split_heredocs` separates the two so
+// the line parser only ever sees the command itself; each body is attached to
+// its `<<` redirection and later handed to the command as stdin.
+// ---------------------------------------------------------------------------
+
+struct HereDocSpec {
+    strip_tabs: bool,
+    delimiter: String,
+}
+
+enum HereDocError {
+    Unterminated(String), // still waiting for this delimiter: ask for more input
+    Syntax(String),       // `<<` with no delimiter word
+}
+
+// The heredocs opened on one command line, in the order they appear.
+fn find_heredocs(line: &str) -> Result<Vec<HereDocSpec>, String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut specs = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        match quote {
+            Some(q) => {
+                if ch == '\\' && q == '"' && i + 1 < chars.len() {
+                    i += 2;
+                } else {
+                    if ch == q {
+                        quote = None;
+                    }
+                    i += 1;
+                }
+            }
+            None => match ch {
+                '\'' | '"' => {
+                    quote = Some(ch);
+                    i += 1;
+                }
+                '\\' if i + 1 < chars.len() => i += 2,
+                // An unquoted `#` at the start of a word begins a comment.
+                '#' if i == 0 || chars[i - 1].is_whitespace() => break,
+                '<' if chars.get(i + 1) == Some(&'<') => {
+                    let strip_tabs = chars.get(i + 2) == Some(&'-');
+                    i += if strip_tabs { 3 } else { 2 };
+                    while chars.get(i).is_some_and(|c| *c == ' ' || *c == '\t') {
+                        i += 1;
+                    }
+                    let (delimiter, next) = read_delimiter(&chars, i);
+                    if delimiter.is_empty() {
+                        return Err(syntax_error("<<"));
+                    }
+                    specs.push(HereDocSpec {
+                        strip_tabs,
+                        delimiter,
+                    });
+                    i = next;
+                }
+                _ => i += 1,
+            },
+        }
+    }
+    Ok(specs)
+}
+
+// Read one heredoc delimiter word, removing quotes and backslashes the way the
+// shell would. Quoting the delimiter suppresses expansion in POSIX; Ash does
+// not expand body text either way, so the dequoted text is all that matters.
+fn read_delimiter(chars: &[char], mut i: usize) -> (String, usize) {
+    let mut delimiter = String::new();
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch.is_whitespace() || matches!(ch, '|' | '&' | ';' | '<' | '>' | '(' | ')') {
+            break;
+        }
+        match ch {
+            '\'' | '"' => {
+                i += 1;
+                while i < chars.len() && chars[i] != ch {
+                    if ch == '"' && chars[i] == '\\' && i + 1 < chars.len() {
+                        i += 1;
+                    }
+                    delimiter.push(chars[i]);
+                    i += 1;
+                }
+                i += 1; // closing quote
+            }
+            '\\' if i + 1 < chars.len() => {
+                delimiter.push(chars[i + 1]);
+                i += 2;
+            }
+            _ => {
+                delimiter.push(ch);
+                i += 1;
+            }
+        }
+    }
+    (delimiter, i)
+}
+
+// Separate `text` (a command line followed by the lines typed after it) into
+// the command line, one body per heredoc in order, and anything left after the
+// last delimiter as further input to run.
+fn split_heredocs(text: &str) -> Result<(String, Vec<String>, Option<String>), HereDocError> {
+    let (command_line, rest) = text.split_once('\n').unwrap_or((text, ""));
+    let specs = find_heredocs(command_line).map_err(HereDocError::Syntax)?;
+    if specs.is_empty() {
+        return Ok((text.to_string(), Vec::new(), None));
+    }
+
+    let mut lines = rest.split('\n');
+    let mut bodies = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        let mut body = String::new();
+        loop {
+            let Some(raw) = lines.next() else {
+                return Err(HereDocError::Unterminated(spec.delimiter.clone()));
+            };
+            let line = if spec.strip_tabs {
+                raw.trim_start_matches('\t')
+            } else {
+                raw
+            };
+            if line == spec.delimiter {
+                break;
+            }
+            body.push_str(line);
+            body.push('\n');
+        }
+        bodies.push(body);
+    }
+
+    let leftover: Vec<&str> = lines.collect();
+    let leftover = (!leftover.is_empty()).then(|| leftover.join("\n"));
+    Ok((command_line.to_string(), bodies, leftover))
+}
+
+// Attach the collected bodies to their redirections, in the order they were
+// read. `find_heredocs` and the parser agree on that order.
+fn attach_heredocs(steps: &mut [Step], bodies: Vec<String>) -> Result<(), String> {
+    let mut bodies = bodies.into_iter();
+    for step in steps.iter_mut() {
+        for stage in step.stages.iter_mut() {
+            for redir in stage.redirs.iter_mut() {
+                if matches!(redir.kind, RedirKind::HereDoc) {
+                    redir.body = bodies.next().ok_or_else(|| syntax_error("<<"))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // Group the token stream into steps of pipelines. Errors carry the full
 // `ash: syntax error …` message.
 fn parse_line(line: &str) -> Result<Vec<Step>, String> {
@@ -919,7 +1152,11 @@ fn parse_line(line: &str) -> Result<Vec<Step>, String> {
             match tok {
                 Tok::Word(word) => {
                     target = None;
-                    stage.redirs.push(Redir { kind, target: word });
+                    stage.redirs.push(Redir {
+                        kind,
+                        target: word,
+                        body: String::new(),
+                    });
                     continue;
                 }
                 other => return Err(syntax_error(tok_name(&other))),
@@ -932,6 +1169,7 @@ fn parse_line(line: &str) -> Result<Vec<Step>, String> {
             Tok::Redir(kind) => stage.redirs.push(Redir {
                 kind,
                 target: String::new(),
+                body: String::new(),
             }),
             op => {
                 let (name, join) = match op {
@@ -1252,6 +1490,7 @@ fn stage_slots(
                 slots[1] = FdSlot::File(open_target(&redir.target, true, false)?);
                 slots[2] = dup_slot(&slots[1])?;
             }
+            RedirKind::HereDoc => slots[0] = FdSlot::File(heredoc_input(&redir.body)?),
             // `2>&1` copies wherever fd 1 currently points — a pipe, a file
             // or the terminal — onto fd 2, in the order the user wrote it.
             RedirKind::Dup { fd, from } => {
@@ -1276,6 +1515,31 @@ fn open_target(target: &str, write: bool, append: bool) -> Result<std::fs::File,
         .truncate(write && !append)
         .open(path)
         .map_err(|error| format!("ash: cannot open {target}: {error}"))
+}
+
+// A heredoc reaches its command as an ordinary readable file: write the body
+// to a temporary file, unlink it while the handle is still open, and rewind.
+fn heredoc_input(body: &str) -> Result<std::fs::File, String> {
+    use std::io::{Seek, SeekFrom};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "ash-heredoc-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| format!("ash: cannot create heredoc: {error}"))?;
+    let _ = std::fs::remove_file(&path);
+    file.write_all(body.as_bytes())
+        .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+        .map_err(|error| format!("ash: cannot write heredoc: {error}"))?;
+    Ok(file)
 }
 
 // A second handle on the same file or pipe: same open description, so write
@@ -1449,4 +1713,248 @@ fn set_default_shell() -> Result<()> {
 
     println!("Default shell is now {exe}. Log out and back in to use it.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    // Parse `line` fully (quotes removed) and return the words of each stage.
+    fn stages(line: &str) -> Vec<Vec<String>> {
+        let mut steps = parse_line(line).unwrap_or_else(|e| panic!("{line:?}: {e}"));
+        unquote(&mut steps).unwrap_or_else(|e| panic!("{line:?}: {e}"));
+        steps
+            .into_iter()
+            .flat_map(|step| step.stages)
+            .map(|stage| stage.words)
+            .collect()
+    }
+
+    fn words(line: &str) -> Vec<String> {
+        stages(line).into_iter().flatten().collect()
+    }
+
+    fn step_count(line: &str) -> usize {
+        parse_line(line)
+            .unwrap_or_else(|e| panic!("{line:?}: {e}"))
+            .len()
+    }
+
+    fn parse_error(line: &str) -> String {
+        parse_line(line)
+            .err()
+            .unwrap_or_else(|| panic!("{line:?} should not parse"))
+    }
+
+    fn unquote_error(line: &str) -> String {
+        let mut steps = parse_line(line).unwrap_or_else(|e| panic!("{line:?}: {e}"));
+        unquote(&mut steps)
+            .err()
+            .unwrap_or_else(|| panic!("{line:?} should not unquote"))
+    }
+
+    fn joins(line: &str) -> Vec<&'static str> {
+        parse_line(line)
+            .unwrap_or_else(|e| panic!("{line:?}: {e}"))
+            .iter()
+            .map(|step| match step.join {
+                Some(Join::And) => "&&",
+                Some(Join::Or) => "||",
+                Some(Join::Semi) => ";",
+                None => "end",
+            })
+            .collect()
+    }
+
+    fn redirs(line: &str) -> Vec<(&'static str, String)> {
+        let mut steps = parse_line(line).unwrap_or_else(|e| panic!("{line:?}: {e}"));
+        unquote(&mut steps).unwrap_or_else(|e| panic!("{line:?}: {e}"));
+        steps
+            .into_iter()
+            .flat_map(|step| step.stages)
+            .flat_map(|stage| stage.redirs)
+            .map(|redir| (redir.kind.token(), redir.target))
+            .collect()
+    }
+
+    fn command_arg(args: &[&str]) -> Option<String> {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_args(&owned)
+            .unwrap_or_else(|e| panic!("{args:?}: {e:#}"))
+            .and_then(|shell| shell.command)
+    }
+
+    fn args_error(args: &[&str]) -> bool {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_args(&owned).is_err()
+    }
+
+    #[test]
+    fn a_simple_command_splits_into_words() {
+        assert_eq!(words("ls -la /tmp"), v(&["ls", "-la", "/tmp"]));
+        assert_eq!(stages("ls -la /tmp").len(), 1);
+    }
+
+    #[test]
+    fn quotes_group_words_and_are_removed() {
+        assert_eq!(
+            words(r#"echo "hello world" 'second arg'"#),
+            v(&["echo", "hello world", "second arg"])
+        );
+    }
+
+    #[test]
+    fn backslash_escapes_stay_inside_one_word() {
+        assert_eq!(words(r"echo hello\ world"), v(&["echo", "hello world"]));
+        assert_eq!(words(r#"echo "a\"b""#), v(&["echo", "a\"b"]));
+    }
+
+    #[test]
+    fn unmatched_quotes_are_reported() {
+        assert_eq!(
+            unquote_error(r#"echo "oops"#),
+            "ash: syntax error: unmatched quote"
+        );
+        assert_eq!(
+            unquote_error("echo 'oops"),
+            "ash: syntax error: unmatched quote"
+        );
+    }
+
+    #[test]
+    fn pipelines_stay_in_one_step() {
+        assert_eq!(stages("cat f | grep x | head -1").len(), 3);
+        assert_eq!(step_count("cat f | grep x"), 1);
+        assert_eq!(joins("cat f | grep x"), vec!["end"]);
+    }
+
+    #[test]
+    fn sequencing_splits_steps_and_records_the_join() {
+        assert_eq!(step_count("a && b || c ; d"), 4);
+        assert_eq!(joins("a && b || c ; d"), vec!["&&", "||", ";", "end"]);
+    }
+
+    #[test]
+    fn trailing_semicolons_and_blank_lines() {
+        assert_eq!(step_count("echo a;"), 1);
+        assert_eq!(step_count("   "), 0);
+        assert_eq!(step_count("\t\n"), 0);
+    }
+
+    #[test]
+    fn missing_commands_around_operators_are_syntax_errors() {
+        assert_eq!(parse_error("| cat"), syntax_error("|"));
+        assert_eq!(parse_error("cat |"), syntax_error("|"));
+        assert_eq!(parse_error("a &&"), syntax_error("&&"));
+        assert_eq!(parse_error("a ||"), syntax_error("||"));
+        assert_eq!(parse_error("a ;; b"), syntax_error(";"));
+    }
+
+    #[test]
+    fn redirections_keep_their_kind_and_target() {
+        assert_eq!(
+            redirs("echo hi > out.txt 2>> err.txt < in.txt &> all.txt"),
+            vec![
+                (">", "out.txt".to_string()),
+                ("2>>", "err.txt".to_string()),
+                ("<", "in.txt".to_string()),
+                ("&>", "all.txt".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn descriptor_duplication_takes_no_file() {
+        assert_eq!(redirs("cmd 2>&1"), vec![(">&", String::new())]);
+        assert_eq!(words("cmd 2>&1"), v(&["cmd"]));
+    }
+
+    #[test]
+    fn redirect_targets_are_unquoted() {
+        assert_eq!(
+            redirs(r#"echo hi > "my file.txt""#),
+            vec![(">", "my file.txt".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_redirect_without_a_file_is_a_syntax_error() {
+        assert_eq!(parse_error("echo hi >"), syntax_error(">"));
+        assert_eq!(parse_error("echo hi 2>"), syntax_error("2>"));
+        assert_eq!(parse_error("echo hi <"), syntax_error("<"));
+    }
+
+    #[test]
+    fn a_comment_ends_the_line_but_not_a_word() {
+        assert_eq!(words("echo a # trailing"), v(&["echo", "a"]));
+        assert_eq!(step_count("# only a comment"), 0);
+        assert_eq!(words("echo a#b"), v(&["echo", "a#b"]));
+        assert_eq!(words(r#"echo "a # b""#), v(&["echo", "a # b"]));
+        assert_eq!(words(r"echo a\#b"), v(&["echo", "a#b"]));
+    }
+
+    #[test]
+    fn read_word_stops_at_metacharacters_and_keeps_quotes() {
+        let chars: Vec<char> = "foo|bar".chars().collect();
+        assert_eq!(read_word(&chars, 0), ("foo".to_string(), 3));
+        let quoted: Vec<char> = r#""a b" tail"#.chars().collect();
+        assert_eq!(read_word(&quoted, 0), (r#""a b""#.to_string(), 5));
+    }
+
+    #[test]
+    fn stored_bodies_keep_quotes_except_for_operators() {
+        assert_eq!(
+            tokenize_stored_body("ls -la '&&' x"),
+            vec!["ls", "-la", "&&", "x"]
+        );
+        assert_eq!(tokenize_stored_body("'echo hi'"), vec!["'echo hi'"]);
+        assert_eq!(
+            unmigrate_stored_body("'echo' 'a' '&&' 'echo' 'b'"),
+            "'echo' 'a' && 'echo' 'b'"
+        );
+        assert!(is_operator_content("2>&1"));
+        assert!(is_operator_content("&&"));
+        assert!(!is_operator_content("ls"));
+        assert!(!is_operator_content(""));
+    }
+
+    #[test]
+    fn parse_args_reads_the_c_flag_in_its_forms() {
+        assert_eq!(
+            command_arg(&["-c", "echo hi"]),
+            Some("echo hi".to_string())
+        );
+        assert_eq!(command_arg(&["-lc", "ls"]), Some("ls".to_string()));
+        assert_eq!(command_arg(&["-cecho hi"]), Some("echo hi".to_string()));
+        assert_eq!(command_arg(&["-il"]), None);
+        assert_eq!(command_arg(&["-"]), None);
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_flags_and_missing_c_arguments() {
+        assert!(args_error(&["--bogus"]));
+        assert!(args_error(&["file.txt"]));
+        assert!(args_error(&["-c"]));
+    }
+
+    fn with_join(join: Option<Join>) -> Step {
+        Step {
+            stages: Vec::new(),
+            join,
+        }
+    }
+
+    #[test]
+    fn step_runs_after_honours_and_or_and_semicolon() {
+        assert!(step_runs_after(&with_join(Some(Join::And)), 0));
+        assert!(!step_runs_after(&with_join(Some(Join::And)), 1));
+        assert!(step_runs_after(&with_join(Some(Join::Or)), 1));
+        assert!(!step_runs_after(&with_join(Some(Join::Or)), 0));
+        assert!(step_runs_after(&with_join(Some(Join::Semi)), 1));
+        assert!(step_runs_after(&with_join(None), 1));
+    }
 }
