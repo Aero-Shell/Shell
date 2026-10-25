@@ -12,13 +12,12 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use aeroshell::{config, packages, registry};
 
 mod commands;
-mod history_search;
 mod syntax_highlight;
 
 use commands::aepkg as aepkg_cmd;
@@ -210,56 +209,6 @@ fn history_suggestion(
     }
 }
 
-// The line being edited when history search was requested, plus the width of
-// any inline hint drawn after it. The line is restored at its original cursor
-// position if the picker is cancelled, and the hint width lets the caller know
-// whether the interrupted prompt occupied more than one terminal row.
-#[derive(Clone, Default)]
-struct SearchRequest(Arc<Mutex<Option<(String, usize, usize)>>>);
-
-impl SearchRequest {
-    fn set(&self, line: &str, pos: usize, hint_len: usize) {
-        *self.0.lock().expect("search request lock poisoned") =
-            Some((line.to_string(), pos, hint_len));
-    }
-
-    fn take(&self) -> Option<(String, usize, usize)> {
-        self.0
-            .lock()
-            .expect("search request lock poisoned")
-            .take()
-    }
-
-    fn clear(&self) {
-        *self.0.lock().expect("search request lock poisoned") = None;
-    }
-}
-
-// Ctrl-R opens the history picker from anywhere on the line. Up does it only
-// when a partial command has been typed (so plain Up still browses history on
-// an empty prompt, the way it always has).
-struct OpenHistorySearch {
-    request: SearchRequest,
-    needs_prefix: bool,
-}
-
-impl ConditionalEventHandler for OpenHistorySearch {
-    fn handle(
-        &self,
-        _event: &Event,
-        _count: RepeatCount,
-        _positive: bool,
-        ctx: &EventContext,
-    ) -> Option<Cmd> {
-        if self.needs_prefix && ctx.line().trim().is_empty() {
-            return Some(Cmd::PreviousHistory);
-        }
-        let hint_len = ctx.hint_text().map_or(0, |hint| hint.chars().count());
-        self.request.set(ctx.line(), ctx.pos(), hint_len);
-        Some(Cmd::Interrupt)
-    }
-}
-
 struct AcceptHint {
     hint_state: HintState,
     fallback: Cmd,
@@ -444,19 +393,6 @@ fn main() -> Result<()> {
             EventHandler::Conditional(Box::new(AcceptHint {
                 hint_state: hint_state.clone(),
                 fallback,
-            })),
-        );
-    }
-    let search_request = SearchRequest::default();
-    for (key, needs_prefix) in [
-        (KeyEvent::ctrl('R'), false),
-        (KeyEvent(KeyCode::Up, Modifiers::NONE), true),
-    ] {
-        let _ = rl.bind_sequence(
-            key,
-            EventHandler::Conditional(Box::new(OpenHistorySearch {
-                request: search_request.clone(),
-                needs_prefix,
             })),
         );
     }
