@@ -1,7 +1,10 @@
 use anyhow::Result;
-use rustyline::highlight::Highlighter;
-use rustyline::history::DefaultHistory;
-use rustyline::{CompletionType, Config as RLConfig, Editor};
+use rustyline::highlight::{CmdKind, Highlighter};
+use rustyline::history::{DefaultHistory, History, SearchDirection};
+use rustyline::{
+    Cmd, CompletionType, ConditionalEventHandler, Config as RLConfig, Editor, Event, EventContext,
+    EventHandler, KeyCode, KeyEvent, Modifiers, Movement, RepeatCount,
+};
 use shlex;
 use std::borrow::Cow;
 use std::io::{IsTerminal, Write};
@@ -9,10 +12,14 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aeroshell::{config, packages, registry};
 
 mod commands;
+mod history_search;
+mod syntax_highlight;
 
 use commands::aepkg as aepkg_cmd;
 use commands::builtins;
@@ -107,9 +114,24 @@ fn quiet_exit_code(status: &ExitStatus) -> i32 {
     status.code().unwrap_or(1)
 }
 
+#[derive(Clone, Default)]
+struct HintState(Arc<AtomicBool>);
+
+impl HintState {
+    fn shown(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn set(&self, shown: bool) {
+        self.0.store(shown, Ordering::Relaxed);
+    }
+}
+
 // Feeds the (pre-styled) prompt back to rustyline and strips ANSI codes for
 // width computation, so colored prompts keep correct cursor positioning.
-struct AeroHelper;
+struct AeroHelper {
+    hint_state: HintState,
+}
 
 impl rustyline::completion::Completer for AeroHelper {
     type Candidate = String;
@@ -146,14 +168,154 @@ impl rustyline::completion::Completer for AeroHelper {
 }
 impl rustyline::hint::Hinter for AeroHelper {
     type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, ctx: &rustyline::Context<'_>) -> Option<String> {
+        let hint = history_suggestion(line, pos, ctx.history(), ctx.history_index());
+        self.hint_state.set(hint.is_some());
+        hint
+    }
 }
+
+fn history_suggestion(
+    line: &str,
+    pos: usize,
+    history: &dyn History,
+    history_index: usize,
+) -> Option<String> {
+    if line.is_empty() || pos < line.len() || line.contains('\n') {
+        return None;
+    }
+
+    // While browsing history, stay at or before the entry being edited.
+    let mut start = if history_index >= history.len() {
+        history.len().saturating_sub(1)
+    } else {
+        history_index
+    };
+    loop {
+        let found = history
+            .starts_with(line, start, SearchDirection::Reverse)
+            .ok()
+            .flatten()?;
+        let suffix = &found.entry[line.len()..];
+        if !suffix.is_empty() && !suffix.contains('\n') {
+            return Some(suffix.to_string());
+        }
+        // An exact entry (or a multi-line one) offers nothing to show; try
+        // the entry before it.
+        if found.idx == 0 {
+            return None;
+        }
+        start = found.idx - 1;
+    }
+}
+
+// The line being edited when history search was requested, plus the width of
+// any inline hint drawn after it. The line is restored at its original cursor
+// position if the picker is cancelled, and the hint width lets the caller know
+// whether the interrupted prompt occupied more than one terminal row.
+#[derive(Clone, Default)]
+struct SearchRequest(Arc<Mutex<Option<(String, usize, usize)>>>);
+
+impl SearchRequest {
+    fn set(&self, line: &str, pos: usize, hint_len: usize) {
+        *self.0.lock().expect("search request lock poisoned") =
+            Some((line.to_string(), pos, hint_len));
+    }
+
+    fn take(&self) -> Option<(String, usize, usize)> {
+        self.0
+            .lock()
+            .expect("search request lock poisoned")
+            .take()
+    }
+
+    fn clear(&self) {
+        *self.0.lock().expect("search request lock poisoned") = None;
+    }
+}
+
+// Ctrl-R opens the history picker from anywhere on the line. Up does it only
+// when a partial command has been typed (so plain Up still browses history on
+// an empty prompt, the way it always has).
+struct OpenHistorySearch {
+    request: SearchRequest,
+    needs_prefix: bool,
+}
+
+impl ConditionalEventHandler for OpenHistorySearch {
+    fn handle(
+        &self,
+        _event: &Event,
+        _count: RepeatCount,
+        _positive: bool,
+        ctx: &EventContext,
+    ) -> Option<Cmd> {
+        if self.needs_prefix && ctx.line().trim().is_empty() {
+            return Some(Cmd::PreviousHistory);
+        }
+        let hint_len = ctx.hint_text().map_or(0, |hint| hint.chars().count());
+        self.request.set(ctx.line(), ctx.pos(), hint_len);
+        Some(Cmd::Interrupt)
+    }
+}
+
+struct AcceptHint {
+    hint_state: HintState,
+    fallback: Cmd,
+}
+
+impl ConditionalEventHandler for AcceptHint {
+    fn handle(
+        &self,
+        _event: &Event,
+        count: RepeatCount,
+        _positive: bool,
+        ctx: &EventContext,
+    ) -> Option<Cmd> {
+        if self.hint_state.shown() && ctx.pos() == ctx.line().len() {
+            return Some(Cmd::CompleteHint);
+        }
+        Some(match self.fallback {
+            Cmd::Move(Movement::ForwardChar(_)) => Cmd::Move(Movement::ForwardChar(count)),
+            ref other => other.clone(),
+        })
+    }
+}
+
 impl Highlighter for AeroHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        Cow::Owned(syntax_highlight::highlight(line))
+    }
+
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
         &'s self,
         prompt: &'p str,
         _default: bool,
     ) -> Cow<'b, str> {
         Cow::Borrowed(prompt)
+    }
+
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Owned(config::colorize(hint, "autosuggestion"))
+    }
+
+    fn highlight_candidate<'c>(
+        &self,
+        candidate: &'c str,
+        _completion: CompletionType,
+    ) -> Cow<'c, str> {
+        Cow::Owned(config::colorize(candidate, "autosuggestion"))
+    }
+
+    fn highlight_char(&self, line: &str, pos: usize, kind: CmdKind) -> bool {
+        // Ask for a repaint when the cursor leaves the end of the line so the
+        // now-stale suggestion is erased. It stays hidden until an edit makes
+        // rustyline compute a hint again.
+        if kind == CmdKind::MoveCursor && self.hint_state.shown() && pos < line.len() {
+            self.hint_state.set(false);
+        }
+        true
     }
 }
 impl rustyline::validate::Validator for AeroHelper {}
@@ -260,8 +422,44 @@ fn main() -> Result<()> {
         .build();
     let mut rl: Editor<AeroHelper, DefaultHistory> =
         Editor::with_history(rl_config, DefaultHistory::new())?;
-    // with_history() leaves the helper unset; Tab needs it explicitly.
-    rl.set_helper(Some(AeroHelper));
+    let hint_state = HintState::default();
+    rl.set_helper(Some(AeroHelper {
+        hint_state: hint_state.clone(),
+    }));
+    let accept_keys = [
+        (
+            KeyEvent(KeyCode::Right, Modifiers::NONE),
+            Cmd::Move(Movement::ForwardChar(1)),
+        ),
+        (
+            KeyEvent(KeyCode::End, Modifiers::NONE),
+            Cmd::Move(Movement::EndOfLine),
+        ),
+        (KeyEvent::ctrl('E'), Cmd::Move(Movement::EndOfLine)),
+        (KeyEvent::ctrl('F'), Cmd::Move(Movement::ForwardChar(1))),
+    ];
+    for (key, fallback) in accept_keys {
+        let _ = rl.bind_sequence(
+            key,
+            EventHandler::Conditional(Box::new(AcceptHint {
+                hint_state: hint_state.clone(),
+                fallback,
+            })),
+        );
+    }
+    let search_request = SearchRequest::default();
+    for (key, needs_prefix) in [
+        (KeyEvent::ctrl('R'), false),
+        (KeyEvent(KeyCode::Up, Modifiers::NONE), true),
+    ] {
+        let _ = rl.bind_sequence(
+            key,
+            EventHandler::Conditional(Box::new(OpenHistorySearch {
+                request: search_request.clone(),
+                needs_prefix,
+            })),
+        );
+    }
 
     if let Ok(path) = config::history_path() {
         let _ = rl.load_history(&path);
@@ -275,18 +473,15 @@ fn main() -> Result<()> {
         let template = config_guard.prompt_template.clone();
         let prompt = config::format_prompt(&template);
 
-        let mut line = match rl.readline(&prompt) {
-            Ok(l) => l,
-            Err(rustyline::error::ReadlineError::Interrupted) => continue,
-            Err(rustyline::error::ReadlineError::Eof) => {
+        let mut line = match read_prompt_line(&mut rl, &prompt, &search_request)? {
+            PromptLine::Line(line) => line,
+            PromptLine::Interrupted => continue,
+            PromptLine::Eof => {
                 // Ctrl-D is normal here; EOF from a closed pipe ends input.
                 if std::io::stdin().is_terminal() {
                     continue;
                 }
                 break;
-            }
-            Err(e) => {
-                return Err(e.into());
             }
         };
 
@@ -303,6 +498,10 @@ fn main() -> Result<()> {
                 }
                 Err(rustyline::error::ReadlineError::Interrupted)
                 | Err(rustyline::error::ReadlineError::Eof) => {
+                    // Ctrl-R inside a heredoc body cancels the heredoc rather
+                    // than searching; make sure it cannot leak into the next
+                    // prompt's Ctrl-C handling.
+                    search_request.clear();
                     registry::print_colored(
                         &format!("ash: heredoc '{delimiter}' cancelled"),
                         "warning",
@@ -335,6 +534,70 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// The result of reading at the interactive prompt.
+enum PromptLine {
+    Line(String),
+    Interrupted,
+    Eof,
+}
+
+// Read one prompt line, interposing the history picker when Ctrl-R (or Up on
+// a partial command) asked for it. A picker accepts a command back into the
+// prompt for editing; cancelling restores the line and cursor that were being
+// edited before the search.
+fn read_prompt_line(
+    rl: &mut Editor<AeroHelper, DefaultHistory>,
+    prompt: &str,
+    search: &SearchRequest,
+) -> rustyline::Result<PromptLine> {
+    // (text before the cursor, text after it) for the next readline call.
+    let mut resume: Option<(String, String)> = None;
+    loop {
+        let read = match &resume {
+            Some((left, right)) => rl.readline_with_initial(prompt, (left.as_str(), right.as_str())),
+            None => rl.readline(prompt),
+        };
+        match read {
+            Ok(line) => return Ok(PromptLine::Line(line)),
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                let Some((line, pos, hint_len)) = search.take() else {
+                    return Ok(PromptLine::Interrupted);
+                };
+                let entries = history_entries(rl);
+                let picked = history_search::pick(entries, &line);
+                history_search::erase_prompt_line(prompt, &line, hint_len);
+                resume = Some(match picked {
+                    history_search::Picked::Entry(entry) => (entry, String::new()),
+                    history_search::Picked::Cancelled => split_at_cursor(line, pos),
+                    history_search::Picked::Unavailable => {
+                        registry::print_colored("ash: no history to search yet", "warning");
+                        split_at_cursor(line, pos)
+                    }
+                });
+            }
+            Err(rustyline::error::ReadlineError::Eof) => return Ok(PromptLine::Eof),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+// Every in-memory history entry, oldest first.
+fn history_entries(rl: &Editor<AeroHelper, DefaultHistory>) -> Vec<String> {
+    rl.history().iter().cloned().collect()
+}
+
+// Split `text` at `pos`, backing up to the nearest character boundary so the
+// pair can be handed back to rustyline safely.
+fn split_at_cursor(text: String, pos: usize) -> (String, String) {
+    let mut at = pos.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let right = text[at..].to_string();
+    let left = text[..at].to_string();
+    (left, right)
 }
 
 // Run one command line: pipelines joined by `&&`, `||` and `;`, with each
@@ -1766,6 +2029,7 @@ fn set_default_shell() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustyline::hint::Hinter;
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -1989,6 +2253,23 @@ mod tests {
         assert!(args_error(&["-c"]));
     }
 
+    #[test]
+    fn split_at_cursor_stays_on_character_boundaries() {
+        assert_eq!(
+            split_at_cursor("abc".to_string(), 1),
+            ("a".to_string(), "bc".to_string())
+        );
+        assert_eq!(
+            split_at_cursor("abc".to_string(), 99),
+            ("abc".to_string(), String::new())
+        );
+        // Byte 2 is inside "é"; the split backs up to the boundary before it.
+        assert_eq!(
+            split_at_cursor("aé".to_string(), 2),
+            ("a".to_string(), "é".to_string())
+        );
+    }
+
     fn with_join(join: Option<Join>) -> Step {
         Step {
             stages: Vec::new(),
@@ -2004,5 +2285,63 @@ mod tests {
         assert!(!step_runs_after(&with_join(Some(Join::Or)), 0));
         assert!(step_runs_after(&with_join(Some(Join::Semi)), 1));
         assert!(step_runs_after(&with_join(None), 1));
+    }
+
+    fn hint_for(line: &str, pos: usize, entries: &[&str]) -> Option<String> {
+        let mut history = rustyline::history::MemHistory::new();
+        for entry in entries {
+            history.add(entry).unwrap();
+        }
+        let helper = AeroHelper {
+            hint_state: HintState::default(),
+        };
+        helper.hint(line, pos, &rustyline::Context::new(&history))
+    }
+
+    #[test]
+    fn history_hint_suggests_the_rest_of_the_newest_match() {
+        let entries = ["echo old", "echo new"];
+        assert_eq!(hint_for("ec", 2, &entries), Some("ho new".into()));
+        assert_eq!(hint_for("git st", 6, &["git status"]), Some("atus".into()));
+    }
+
+    #[test]
+    fn history_hint_stays_out_of_the_way_when_it_has_nothing_to_add() {
+        let entries = ["echo hi"];
+        assert_eq!(hint_for("", 0, &entries), None);
+        assert_eq!(hint_for("zzz", 3, &entries), None);
+        assert_eq!(hint_for("ec", 1, &entries), None); // cursor mid-line
+        assert_eq!(hint_for("ec", 2, &["echo a\necho b"]), None); // multi-line entry
+        assert_eq!(hint_for("ec", 2, &[]), None);
+    }
+
+    #[test]
+    fn history_hint_skips_exact_and_multi_line_entries() {
+        // The newest entry is an exact match, so an older completion wins.
+        assert_eq!(
+            hint_for("echo hi", 7, &["echo hi there", "echo hi"]),
+            Some(" there".into())
+        );
+        // A multi-line heredoc entry is skipped, not rendered as a hint.
+        assert_eq!(
+            hint_for("ec", 2, &["echo old", "echo a\necho b"]),
+            Some("ho old".into())
+        );
+    }
+
+    #[test]
+    fn moving_off_the_end_marks_the_hint_hidden() {
+        let helper = AeroHelper {
+            hint_state: HintState::default(),
+        };
+        let mut history = rustyline::history::MemHistory::new();
+        history.add("echo hi").unwrap();
+        let ctx = rustyline::Context::new(&history);
+
+        assert_eq!(helper.hint("ec", 2, &ctx), Some("ho hi".into()));
+        assert!(helper.hint_state.shown());
+        assert!(helper.highlight_char("ec", 2, CmdKind::MoveCursor));
+        assert!(helper.highlight_char("ec", 1, CmdKind::MoveCursor));
+        assert!(!helper.hint_state.shown());
     }
 }

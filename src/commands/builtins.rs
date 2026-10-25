@@ -222,7 +222,10 @@ const HELP: &[HelpEntry] = &[
         "Change directory ('-' = previous, '~' = home)",
     ),
     cmd("pwd", "Print working directory"),
-    cmd("history [n]", "Show recent commands (last n)"),
+    cmd(
+        "history [n]",
+        "Show recent commands (last n); Ctrl-R searches them interactively",
+    ),
     cmd("export VAR=val", "Set a session environment variable"),
     cmd("unset VAR", "Remove a session environment variable"),
     HelpEntry {
