@@ -409,18 +409,15 @@ fn main() -> Result<()> {
         let template = config_guard.prompt_template.clone();
         let prompt = config::format_prompt(&template);
 
-        let mut line = match rl.readline(&prompt) {
-            Ok(l) => l,
-            Err(rustyline::error::ReadlineError::Interrupted) => continue,
-            Err(rustyline::error::ReadlineError::Eof) => {
+        let mut line = match read_prompt_line(&mut rl, &prompt, &search_request)? {
+            PromptLine::Line(line) => line,
+            PromptLine::Interrupted => continue,
+            PromptLine::Eof => {
                 // Ctrl-D is normal here; EOF from a closed pipe ends input.
                 if std::io::stdin().is_terminal() {
                     continue;
                 }
                 break;
-            }
-            Err(e) => {
-                return Err(e.into());
             }
         };
 
@@ -437,6 +434,10 @@ fn main() -> Result<()> {
                 }
                 Err(rustyline::error::ReadlineError::Interrupted)
                 | Err(rustyline::error::ReadlineError::Eof) => {
+                    // Ctrl-R inside a heredoc body cancels the heredoc rather
+                    // than searching; make sure it cannot leak into the next
+                    // prompt's Ctrl-C handling.
+                    search_request.clear();
                     registry::print_colored(
                         &format!("ash: heredoc '{delimiter}' cancelled"),
                         "warning",
@@ -469,6 +470,69 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// The result of reading at the interactive prompt.
+enum PromptLine {
+    Line(String),
+    Interrupted,
+    Eof,
+}
+
+// Read one prompt line, interposing the history picker when Ctrl-R (or Up on
+// a partial command) asked for it. A picker accepts a command back into the
+// prompt for editing; cancelling restores the line and cursor that were being
+// edited before the search.
+fn read_prompt_line(
+    rl: &mut Editor<AeroHelper, DefaultHistory>,
+    prompt: &str,
+    search: &SearchRequest,
+) -> rustyline::Result<PromptLine> {
+    // (text before the cursor, text after it) for the next readline call.
+    let mut resume: Option<(String, String)> = None;
+    loop {
+        let read = match &resume {
+            Some((left, right)) => rl.readline_with_initial(prompt, (left.as_str(), right.as_str())),
+            None => rl.readline(prompt),
+        };
+        match read {
+            Ok(line) => return Ok(PromptLine::Line(line)),
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                let Some((line, pos, hint_len)) = search.take() else {
+                    return Ok(PromptLine::Interrupted);
+                };
+                let entries = history_entries(rl);
+                let picked = history_search::pick(entries, &line, prompt, hint_len);
+                resume = Some(match picked {
+                    history_search::Picked::Entry(entry) => (entry, String::new()),
+                    history_search::Picked::Cancelled => split_at_cursor(line, pos),
+                    history_search::Picked::Unavailable => {
+                        registry::print_colored("ash: history search unavailable", "warning");
+                        split_at_cursor(line, pos)
+                    }
+                });
+            }
+            Err(rustyline::error::ReadlineError::Eof) => return Ok(PromptLine::Eof),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+// Every in-memory history entry, oldest first.
+fn history_entries(rl: &Editor<AeroHelper, DefaultHistory>) -> Vec<String> {
+    rl.history().iter().cloned().collect()
+}
+
+// Split `text` at `pos`, backing up to the nearest character boundary so the
+// pair can be handed back to rustyline safely.
+fn split_at_cursor(text: String, pos: usize) -> (String, String) {
+    let mut at = pos.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let right = text[at..].to_string();
+    let left = text[..at].to_string();
+    (left, right)
 }
 
 // Run one command line: pipelines joined by `&&`, `||` and `;`, with each
@@ -2122,6 +2186,23 @@ mod tests {
         assert!(args_error(&["--bogus"]));
         assert!(args_error(&["file.txt"]));
         assert!(args_error(&["-c"]));
+    }
+
+    #[test]
+    fn split_at_cursor_stays_on_character_boundaries() {
+        assert_eq!(
+            split_at_cursor("abc".to_string(), 1),
+            ("a".to_string(), "bc".to_string())
+        );
+        assert_eq!(
+            split_at_cursor("abc".to_string(), 99),
+            ("abc".to_string(), String::new())
+        );
+        // Byte 2 is inside "é"; the split backs up to the boundary before it.
+        assert_eq!(
+            split_at_cursor("aé".to_string(), 2),
+            ("a".to_string(), "é".to_string())
+        );
     }
 
     fn with_join(join: Option<Join>) -> Step {

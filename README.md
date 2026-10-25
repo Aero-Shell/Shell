@@ -84,7 +84,7 @@ Built-in commands (also listed by `help`):
 | `ls [--show-hidden] [dir]` | List files in columns; dotfiles hidden unless `--show-hidden` |
 | `cd [dir]` | Change directory (`-` = previous, `~` = home) |
 | `pwd` | Print working directory |
-| `history [n]` | Show recent commands (last n) |
+| `history [n]` | Show recent commands (last n); Ctrl-R searches them interactively |
 | `export VAR=val` | Set a session environment variable |
 | `unset VAR` | Remove a session environment variable |
 | `alias <subcommand>` | Manage aliases: `create <alias> <command…>`, `ls`, `rm <alias>` |
@@ -107,12 +107,38 @@ false && echo skipped || echo ran
 history 20 | tail
 ```
 
+### History search
+
+`Ctrl-R` opens a searchable, navigable history picker. It starts with whatever
+is already on the prompt, so `git ch` followed by `Ctrl-R` jumps straight to
+the matching commands:
+
+```
+ Ash history search                                   3/48
+> git ch
+────────────────────────────────────────────────────────
+> git checkout main
+  git checkout -b feature
+  git cherry-pick HEAD~1
+  1/3   ↑↓ move · enter edit · esc cancel
+```
+
+Type to narrow the list (case-insensitive, with commands that start with the
+query listed first). Move with `↑`/`↓` or `Ctrl-P`/`Ctrl-N`, page with
+`PgUp`/`PgDn`, and jump with `Home`/`End`. `Enter` puts the selected command
+back on the prompt so it can still be edited before running; `Esc` (or
+`Ctrl-C`) restores whatever was being typed. `Ctrl-U` clears the query and
+`Ctrl-W` deletes its last word.
+
+With a partial command typed, `↑` opens the same picker filtered by that text.
+On an empty prompt, `↑` keeps its old job of walking back through history.
+
 ## Configuration
 
 Everything lives in `~/.aeroshell/`:
 
 - `config.json` — settings, colors, aliases
-- `history.txt` — persistent command history (up/down arrows recall)
+- `history.txt` — persistent command history (up/down arrows recall, Ctrl-R searches)
 
 Handy session variables (`export`) survive per session; aliases are persistent
 in `config.json`, e.g
@@ -177,6 +203,7 @@ cargo run
 Code layout:
 
 - `src/main.rs` — REPL, arg parsing, pipelines, login-shell handling
+- `src/history_search.rs` — searchable history picker (Ctrl-R / Up)
 - `src/commands/builtins.rs` — built-in commands
 - `src/commands/aepkg.rs` — package manager command
 - `src/config.rs` — config, themes, prompt rendering
