@@ -170,10 +170,31 @@ impl rustyline::hint::Hinter for AeroHelper {
     type Hint = String;
 
     fn hint(&self, line: &str, pos: usize, ctx: &rustyline::Context<'_>) -> Option<String> {
-        let hint = history_suggestion(line, pos, ctx.history(), ctx.history_index());
+        // A package completion is context-specific, so it wins over a history
+        // suggestion when both apply. Only registered, in-memory candidates
+        // are considered here; filesystem completion stays on Tab.
+        let hint = package_completion_hint(line, pos)
+            .or_else(|| history_suggestion(line, pos, ctx.history(), ctx.history_index()));
         self.hint_state.set(hint.is_some());
         hint
     }
+}
+
+// Preview the rest of a package-provided argument candidate while the word is
+// being typed. Package completions are a plain in-memory lookup, so this is
+// safe to run on every keystroke; path candidates are not (they read the
+// filesystem) and are left to Tab completion.
+fn package_completion_hint(line: &str, pos: usize) -> Option<String> {
+    if line.is_empty() || pos < line.len() || line.contains('\n') {
+        return None;
+    }
+    let start = line[..pos].rfind(char::is_whitespace).map_or(0, |i| i + 1);
+    let word = &line[start..pos];
+    if word.is_empty() {
+        return None;
+    }
+    let head = line[..start].split_whitespace().next()?;
+    packages::lua_api::completion_preview(head, word)
 }
 
 fn history_suggestion(
@@ -2326,6 +2347,60 @@ mod tests {
             hint_for("ec", 2, &["echo old", "echo a\necho b"]),
             Some("ho old".into())
         );
+    }
+
+    fn set_completions(command: &str, candidates: &[&str]) {
+        packages::lua_api::COMPLETIONS.lock().unwrap().insert(
+            command.to_string(),
+            candidates.iter().map(|s| s.to_string()).collect(),
+        );
+    }
+
+    fn clear_completions(command: &str) {
+        packages::lua_api::COMPLETIONS
+            .lock()
+            .unwrap()
+            .remove(command);
+    }
+
+    #[test]
+    fn package_completion_hint_previews_the_first_matching_candidate() {
+        let command = "preview-demo";
+        set_completions(command, &["beta", "alpine", "alpha"]);
+
+        let hint = |line: &str| package_completion_hint(line, line.len());
+        assert_eq!(hint("preview-demo al"), Some("pha".into()));
+        assert_eq!(hint("preview-demo a"), Some("lpha".into()));
+        assert_eq!(hint("preview-demo alpha"), None);
+        assert_eq!(hint("preview-demo zz"), None);
+        assert_eq!(hint("preview-demo "), None);
+        assert_eq!(package_completion_hint("preview-demo al", 14), None);
+        assert_eq!(hint("preview-demo"), None);
+
+        clear_completions(command);
+    }
+
+    #[test]
+    fn package_completion_hint_wins_over_history_but_falls_back_to_it() {
+        let command = "preview-priority";
+        set_completions(command, &["staging"]);
+
+        let line = "preview-priority st";
+        assert_eq!(
+            hint_for(line, line.len(), &["preview-priority status"]),
+            Some("aging".into())
+        );
+
+        let line = "preview-priority x";
+        assert_eq!(
+            hint_for(line, line.len(), &["preview-priority xyz"]),
+            Some("yz".into())
+        );
+
+        let line = "preview-priority st";
+        assert_eq!(hint_for(line, line.len(), &[]), Some("aging".into()));
+
+        clear_completions(command);
     }
 
     #[test]

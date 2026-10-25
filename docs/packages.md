@@ -135,9 +135,16 @@ stage in a pipeline yet.
 | `prompt.set_template(template)` | Set and persist the prompt template |
 | `prompt.color(name, code)` | Alias for `colors.set` |
 | `prompt.add_piece(name, template)` | Register `{{name}}` for prompt templates |
-| `completion.add(command, { … })` | Argument candidates for Tab completion |
+| `completion.add(command, { … })` | Argument candidates for Tab completion and inline preview |
 | `env.get/set/unset` | Session environment |
 | `hooks.register(name, fn)` | Register a hook (see below) |
+
+Registered candidates are also previewed inline in the dim suggestion color
+while you type the argument: the rest of the first matching candidate is shown
+and can be accepted with `→`, `End`, or `Ctrl-F`. Tab completion still lists
+every match.
+Only the in-memory candidate list is consulted, so typing never triggers
+package code or filesystem work.
 
 Prompt placeholders are shared with the shell: `{username} {hostname} {pwd}
 {short_pwd} {time} {date} {battery} {git}`, plus `<color>…</color>` tags. Pieces
