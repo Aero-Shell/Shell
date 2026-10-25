@@ -1,7 +1,10 @@
 use anyhow::Result;
-use rustyline::highlight::Highlighter;
-use rustyline::history::DefaultHistory;
-use rustyline::{CompletionType, Config as RLConfig, Editor};
+use rustyline::highlight::{CmdKind, Highlighter};
+use rustyline::history::{DefaultHistory, History, SearchDirection};
+use rustyline::{
+    Cmd, CompletionType, ConditionalEventHandler, Config as RLConfig, Editor, Event, EventContext,
+    EventHandler, KeyCode, KeyEvent, Modifiers, Movement, RepeatCount,
+};
 use shlex;
 use std::borrow::Cow;
 use std::io::{IsTerminal, Write};
@@ -9,6 +12,8 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use aeroshell::{config, packages, registry};
 
@@ -107,9 +112,23 @@ fn quiet_exit_code(status: &ExitStatus) -> i32 {
     status.code().unwrap_or(1)
 }
 
+struct HintState(Arc<AtomicBool>);
+
+impl HintState {
+    fn shown(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn set(&self, shown: bool) {
+        self.0.store(shown, Ordering::Relaxed);
+    }
+}
+
 // Feeds the (pre-styled) prompt back to rustyline and strips ANSI codes for
 // width computation, so colored prompts keep correct cursor positioning.
-struct AeroHelper;
+struct AeroHelper {
+    hint_state: HintState,
+}
 
 impl rustyline::completion::Completer for AeroHelper {
     type Candidate = String;
@@ -146,7 +165,71 @@ impl rustyline::completion::Completer for AeroHelper {
 }
 impl rustyline::hint::Hinter for AeroHelper {
     type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, ctx: &rustyline::Context<'_>) -> Option<String> {
+        let hint = history_suggestion(line, pos, ctx.history(), ctx.history_index());
+        self.hint_state.set(hint.is_some());
+        hint
+    }
 }
+
+fn history_suggestion(
+    line: &str,
+    pos: usize,
+    history: &dyn History,
+    history_index: usize,
+) -> Option<String> {
+    if line.is_empty() || pos < line.len() || line.contains('\n') {
+        return None;
+    }
+
+    // While browsing history, stay at or before the entry being edited.
+    let mut start = if history_index >= history.len() {
+        history.len().saturating_sub(1)
+    } else {
+        history_index
+    };
+    loop {
+        let found = history
+            .starts_with(line, start, SearchDirection::Reverse)
+            .ok()
+            .flatten()?;
+        let suffix = &found.entry[line.len()..];
+        if !suffix.is_empty() && !suffix.contains('\n') {
+            return Some(suffix.to_string());
+        }
+        // An exact entry (or a multi-line one) offers nothing to show; try
+        // the entry before it.
+        if found.idx == 0 {
+            return None;
+        }
+        start = found.idx - 1;
+    }
+}
+
+struct AcceptHint {
+    hint_state: HintState,
+    fallback: Cmd,
+}
+
+impl ConditionalEventHandler for AcceptHint {
+    fn handle(
+        &self,
+        _event: &Event,
+        count: RepeatCount,
+        _positive: bool,
+        ctx: &EventContext,
+    ) -> Option<Cmd> {
+        if self.hint_state.shown() && ctx.pos() == ctx.line().len() {
+            return Some(Cmd::CompleteHint);
+        }
+        Some(match self.fallback {
+            Cmd::Move(Movement::ForwardChar(_)) => Cmd::Move(Movement::ForwardChar(count)),
+            ref other => other.clone(),
+        })
+    }
+}
+
 impl Highlighter for AeroHelper {
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
         &'s self,
@@ -154,6 +237,30 @@ impl Highlighter for AeroHelper {
         _default: bool,
     ) -> Cow<'b, str> {
         Cow::Borrowed(prompt)
+    }
+
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Owned(config::colorize(hint, "autosuggestion"))
+    }
+
+    fn highlight_candidate<'c>(
+        &self,
+        candidate: &'c str,
+        _completion: CompletionType,
+    ) -> Cow<'c, str> {
+        Cow::Owned(config::colorize(candidate, "autosuggestion"))
+    }
+
+    fn highlight_char(&self, line: &str, pos: usize, kind: CmdKind) -> bool {
+        // Ask for a repaint when the cursor leaves the end of the line so the
+        // now-stale suggestion is erased. It stays hidden until an edit makes
+        // rustyline compute a hint again.
+        if kind == CmdKind::MoveCursor && self.hint_state.shown() && pos < line.len() {
+            self.hint_state.set(false);
+            true
+        } else {
+            false
+        }
     }
 }
 impl rustyline::validate::Validator for AeroHelper {}
@@ -260,8 +367,31 @@ fn main() -> Result<()> {
         .build();
     let mut rl: Editor<AeroHelper, DefaultHistory> =
         Editor::with_history(rl_config, DefaultHistory::new())?;
-    // with_history() leaves the helper unset; Tab needs it explicitly.
-    rl.set_helper(Some(AeroHelper));
+    let hint_state = HintState::default();
+    rl.set_helper(Some(AeroHelper {
+        hint_state: hint_state.clone(),
+    }));
+    let accept_keys = [
+        (
+            KeyEvent(KeyCode::Right, Modifiers::NONE),
+            Cmd::Move(Movement::ForwardChar(1)),
+        ),
+        (
+            KeyEvent(KeyCode::End, Modifiers::NONE),
+            Cmd::Move(Movement::EndOfLine),
+        ),
+        (KeyEvent::ctrl('E'), Cmd::Move(Movement::EndOfLine)),
+        (KeyEvent::ctrl('F'), Cmd::Move(Movement::ForwardChar(1))),
+    ];
+    for (key, fallback) in accept_keys {
+        let _ = rl.bind_sequence(
+            key,
+            EventHandler::Conditional(Box::new(AcceptHint {
+                hint_state: hint_state.clone(),
+                fallback,
+            })),
+        );
+    }
 
     if let Ok(path) = config::history_path() {
         let _ = rl.load_history(&path);
@@ -1766,6 +1896,7 @@ fn set_default_shell() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustyline::hint::Hinter;
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -2004,5 +2135,63 @@ mod tests {
         assert!(!step_runs_after(&with_join(Some(Join::Or)), 0));
         assert!(step_runs_after(&with_join(Some(Join::Semi)), 1));
         assert!(step_runs_after(&with_join(None), 1));
+    }
+
+    fn hint_for(line: &str, pos: usize, entries: &[&str]) -> Option<String> {
+        let mut history = rustyline::history::MemHistory::new();
+        for entry in entries {
+            history.add(entry).unwrap();
+        }
+        let helper = AeroHelper {
+            hint_state: HintState::default(),
+        };
+        helper.hint(line, pos, &rustyline::Context::new(&history))
+    }
+
+    #[test]
+    fn history_hint_suggests_the_rest_of_the_newest_match() {
+        let entries = ["echo old", "echo new"];
+        assert_eq!(hint_for("ec", 2, &entries), Some("ho new".into()));
+        assert_eq!(hint_for("git st", 6, &["git status"]), Some("atus".into()));
+    }
+
+    #[test]
+    fn history_hint_stays_out_of_the_way_when_it_has_nothing_to_add() {
+        let entries = ["echo hi"];
+        assert_eq!(hint_for("", 0, &entries), None);
+        assert_eq!(hint_for("zzz", 3, &entries), None);
+        assert_eq!(hint_for("ec", 1, &entries), None); // cursor mid-line
+        assert_eq!(hint_for("ec", 2, &["echo a\necho b"]), None); // multi-line entry
+        assert_eq!(hint_for("ec", 2, &[]), None);
+    }
+
+    #[test]
+    fn history_hint_skips_exact_and_multi_line_entries() {
+        // The newest entry is an exact match, so an older completion wins.
+        assert_eq!(
+            hint_for("echo hi", 7, &["echo hi there", "echo hi"]),
+            Some(" there".into())
+        );
+        // A multi-line heredoc entry is skipped, not rendered as a hint.
+        assert_eq!(
+            hint_for("ec", 2, &["echo old", "echo a\necho b"]),
+            Some("ho old".into())
+        );
+    }
+
+    #[test]
+    fn moving_off_the_end_marks_the_hint_hidden() {
+        let helper = AeroHelper {
+            hint_state: HintState::default(),
+        };
+        let mut history = rustyline::history::MemHistory::new();
+        history.add("echo hi").unwrap();
+        let ctx = rustyline::Context::new(&history);
+
+        assert_eq!(helper.hint("ec", 2, &ctx), Some("ho hi".into()));
+        assert!(helper.hint_state.shown());
+        assert!(!helper.highlight_char("ec", 2, CmdKind::MoveCursor));
+        assert!(helper.highlight_char("ec", 1, CmdKind::MoveCursor));
+        assert!(!helper.hint_state.shown());
     }
 }
