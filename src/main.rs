@@ -146,7 +146,146 @@ impl rustyline::completion::Completer for AeroHelper {
 }
 impl rustyline::hint::Hinter for AeroHelper {
     type Hint = String;
+<<<<<<< Updated upstream
 }
+=======
+
+    fn hint(&self, line: &str, pos: usize, ctx: &rustyline::Context<'_>) -> Option<String> {
+        // A package completion is context-specific, so it wins over a history
+        // suggestion when both apply. Only registered, in-memory candidates
+        // are considered here; filesystem completion stays on Tab.
+        let hint = package_completion_hint(line, pos)
+            .or_else(|| history_suggestion(line, pos, ctx.history(), ctx.history_index()));
+        self.hint_state.set(hint.is_some());
+        hint
+    }
+}
+
+// Preview the rest of a package-provided argument candidate while the word is
+// being typed. Package completions are a plain in-memory lookup, so this is
+// safe to run on every keystroke; path candidates are not (they read the
+// filesystem) and are left to Tab completion.
+fn package_completion_hint(line: &str, pos: usize) -> Option<String> {
+    if line.is_empty() || pos < line.len() || line.contains('\n') {
+        return None;
+    }
+    let start = line[..pos].rfind(char::is_whitespace).map_or(0, |i| i + 1);
+    let word = &line[start..pos];
+    if word.is_empty() {
+        return None;
+    }
+    let head = line[..start].split_whitespace().next()?;
+    packages::lua_api::completion_preview(head, word)
+}
+
+fn history_suggestion(
+    line: &str,
+    pos: usize,
+    history: &dyn History,
+    history_index: usize,
+) -> Option<String> {
+    if line.is_empty() || pos < line.len() || line.contains('\n') {
+        return None;
+    }
+
+    // While browsing history, stay at or before the entry being edited.
+    let mut start = if history_index >= history.len() {
+        history.len().saturating_sub(1)
+    } else {
+        history_index
+    };
+    loop {
+        let found = history
+            .starts_with(line, start, SearchDirection::Reverse)
+            .ok()
+            .flatten()?;
+        let suffix = &found.entry[line.len()..];
+        if !suffix.is_empty() && !suffix.contains('\n') {
+            return Some(suffix.to_string());
+        }
+        // An exact entry (or a multi-line one) offers nothing to show; try
+        // the entry before it.
+        if found.idx == 0 {
+            return None;
+        }
+        start = found.idx - 1;
+    }
+}
+
+// The line being edited when history search was requested, plus the width of
+// any inline hint drawn after it. The line is restored at its original cursor
+// position if the picker is cancelled, and the hint width lets the caller know
+// whether the interrupted prompt occupied more than one terminal row.
+#[derive(Clone, Default)]
+struct SearchRequest(Arc<Mutex<Option<(String, usize, usize)>>>);
+
+impl SearchRequest {
+    fn set(&self, line: &str, pos: usize, hint_len: usize) {
+        *self.0.lock().expect("search request lock poisoned") =
+            Some((line.to_string(), pos, hint_len));
+    }
+
+    fn take(&self) -> Option<(String, usize, usize)> {
+        self.0
+            .lock()
+            .expect("search request lock poisoned")
+            .take()
+    }
+
+    fn clear(&self) {
+        *self.0.lock().expect("search request lock poisoned") = None;
+    }
+}
+
+// Ctrl-R opens the history picker from anywhere on the line. Up does it only
+// when a partial command has been typed (so plain Up still browses history on
+// an empty prompt, the way it always has).
+struct OpenHistorySearch {
+    request: SearchRequest,
+    needs_prefix: bool,
+}
+
+impl ConditionalEventHandler for OpenHistorySearch {
+    fn handle(
+        &self,
+        _event: &Event,
+        _count: RepeatCount,
+        _positive: bool,
+        ctx: &EventContext,
+    ) -> Option<Cmd> {
+        if self.needs_prefix && ctx.line().trim().is_empty() {
+            return Some(Cmd::PreviousHistory);
+        }
+        let hint_len = ctx.hint_text().map_or(0, |hint| hint.chars().count());
+        self.request.set(ctx.line(), ctx.pos(), hint_len);
+        Some(Cmd::Interrupt)
+    }
+}
+
+struct AcceptHint {
+    hint_state: HintState,
+    fallback: Cmd,
+}
+
+impl ConditionalEventHandler for AcceptHint {
+    fn handle(
+        &self,
+        _event: &Event,
+        count: RepeatCount,
+        _positive: bool,
+        ctx: &EventContext,
+    ) -> Option<Cmd> {
+        if self.hint_state.shown() && ctx.pos() == ctx.line().len() {
+            return Some(Cmd::CompleteHint);
+        }
+        Some(match self.fallback {
+            Cmd::Move(Movement::ForwardChar(_)) => Cmd::Move(Movement::ForwardChar(count)),
+            ref other => other.clone(),
+        })
+    }
+}
+
+>>>>>>> Stashed changes
 impl Highlighter for AeroHelper {
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
         &'s self,
@@ -2005,4 +2144,119 @@ mod tests {
         assert!(step_runs_after(&with_join(Some(Join::Semi)), 1));
         assert!(step_runs_after(&with_join(None), 1));
     }
+<<<<<<< Updated upstream
+=======
+
+    fn hint_for(line: &str, pos: usize, entries: &[&str]) -> Option<String> {
+        let mut history = rustyline::history::MemHistory::new();
+        for entry in entries {
+            history.add(entry).unwrap();
+        }
+        let helper = AeroHelper {
+            hint_state: HintState::default(),
+        };
+        helper.hint(line, pos, &rustyline::Context::new(&history))
+    }
+
+    #[test]
+    fn history_hint_suggests_the_rest_of_the_newest_match() {
+        let entries = ["echo old", "echo new"];
+        assert_eq!(hint_for("ec", 2, &entries), Some("ho new".into()));
+        assert_eq!(hint_for("git st", 6, &["git status"]), Some("atus".into()));
+    }
+
+    #[test]
+    fn history_hint_stays_out_of_the_way_when_it_has_nothing_to_add() {
+        let entries = ["echo hi"];
+        assert_eq!(hint_for("", 0, &entries), None);
+        assert_eq!(hint_for("zzz", 3, &entries), None);
+        assert_eq!(hint_for("ec", 1, &entries), None); // cursor mid-line
+        assert_eq!(hint_for("ec", 2, &["echo a\necho b"]), None); // multi-line entry
+        assert_eq!(hint_for("ec", 2, &[]), None);
+    }
+
+    #[test]
+    fn history_hint_skips_exact_and_multi_line_entries() {
+        // The newest entry is an exact match, so an older completion wins.
+        assert_eq!(
+            hint_for("echo hi", 7, &["echo hi there", "echo hi"]),
+            Some(" there".into())
+        );
+        // A multi-line heredoc entry is skipped, not rendered as a hint.
+        assert_eq!(
+            hint_for("ec", 2, &["echo old", "echo a\necho b"]),
+            Some("ho old".into())
+        );
+    }
+
+    fn set_completions(command: &str, candidates: &[&str]) {
+        packages::lua_api::COMPLETIONS.lock().unwrap().insert(
+            command.to_string(),
+            candidates.iter().map(|s| s.to_string()).collect(),
+        );
+    }
+
+    fn clear_completions(command: &str) {
+        packages::lua_api::COMPLETIONS
+            .lock()
+            .unwrap()
+            .remove(command);
+    }
+
+    #[test]
+    fn package_completion_hint_previews_the_first_matching_candidate() {
+        let command = "preview-demo";
+        set_completions(command, &["beta", "alpine", "alpha"]);
+
+        let hint = |line: &str| package_completion_hint(line, line.len());
+        assert_eq!(hint("preview-demo al"), Some("pha".into()));
+        assert_eq!(hint("preview-demo a"), Some("lpha".into()));
+        assert_eq!(hint("preview-demo alpha"), None);
+        assert_eq!(hint("preview-demo zz"), None);
+        assert_eq!(hint("preview-demo "), None);
+        assert_eq!(package_completion_hint("preview-demo al", 14), None);
+        assert_eq!(hint("preview-demo"), None);
+
+        clear_completions(command);
+    }
+
+    #[test]
+    fn package_completion_hint_wins_over_history_but_falls_back_to_it() {
+        let command = "preview-priority";
+        set_completions(command, &["staging"]);
+
+        let line = "preview-priority st";
+        assert_eq!(
+            hint_for(line, line.len(), &["preview-priority status"]),
+            Some("aging".into())
+        );
+
+        let line = "preview-priority x";
+        assert_eq!(
+            hint_for(line, line.len(), &["preview-priority xyz"]),
+            Some("yz".into())
+        );
+
+        let line = "preview-priority st";
+        assert_eq!(hint_for(line, line.len(), &[]), Some("aging".into()));
+
+        clear_completions(command);
+    }
+
+    #[test]
+    fn moving_off_the_end_marks_the_hint_hidden() {
+        let helper = AeroHelper {
+            hint_state: HintState::default(),
+        };
+        let mut history = rustyline::history::MemHistory::new();
+        history.add("echo hi").unwrap();
+        let ctx = rustyline::Context::new(&history);
+
+        assert_eq!(helper.hint("ec", 2, &ctx), Some("ho hi".into()));
+        assert!(helper.hint_state.shown());
+        assert!(helper.highlight_char("ec", 2, CmdKind::MoveCursor));
+        assert!(helper.highlight_char("ec", 1, CmdKind::MoveCursor));
+        assert!(!helper.hint_state.shown());
+    }
+>>>>>>> Stashed changes
 }

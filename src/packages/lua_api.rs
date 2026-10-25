@@ -277,6 +277,30 @@ pub fn completions_for(command: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The rest of the first matching candidate that extends `prefix`, if one
+/// exists. Candidates are ordered the way Tab lists them.
+///
+/// This only reads the in-memory completion table; it never runs package code
+/// or touches the filesystem, so the line editor can call it on every
+/// keystroke. Path and command-name completions are deliberately excluded
+/// because those are not cheap to compute.
+pub fn completion_preview(command: &str, prefix: &str) -> Option<String> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let completions = COMPLETIONS.lock().ok()?;
+    let candidates = completions.get(command)?;
+    let candidate = candidates
+        .iter()
+        .filter(|candidate| candidate.len() > prefix.len() && candidate.starts_with(prefix))
+        .min()?;
+    let suffix = &candidate[prefix.len()..];
+    if suffix.contains('\n') || suffix.contains('\r') {
+        return None;
+    }
+    Some(suffix.to_string())
+}
+
 pub fn all_completions() -> Vec<(String, Vec<String>)> {
     let completions = COMPLETIONS.lock().expect("completion lock poisoned");
     let mut entries: Vec<(String, Vec<String>)> = completions
@@ -633,6 +657,10 @@ fn hook_register(lua: &Lua, (name, function): (String, LuaFunction)) -> LuaResul
 mod tests {
     use super::*;
 
+    // Tests that inspect the shared completion table reset it, so they must
+    // not run in parallel with each other.
+    static COMPLETION_TESTS: Mutex<()> = Mutex::new(());
+
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ash-lua-test-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -680,6 +708,7 @@ end
 
     #[test]
     fn completion_definitions_populate_candidates() {
+        let _guard = COMPLETION_TESTS.lock().unwrap();
         reset_runtime().unwrap();
         reset_completions();
         let dir = temp_dir("completion");
@@ -689,6 +718,43 @@ end
         run_package_file(&dir, &entry).unwrap();
         assert_eq!(completions_for("greet"), vec!["alpha", "beta"]);
         assert!(completions_for("other").is_empty());
+    }
+
+    #[test]
+    fn completion_preview_extends_the_first_matching_candidate() {
+        let _guard = COMPLETION_TESTS.lock().unwrap();
+        let command = "preview-test-command";
+        COMPLETIONS.lock().unwrap().insert(
+            command.to_string(),
+            vec![
+                "beta".to_string(),
+                "alpine".to_string(),
+                "alpha".to_string(),
+            ],
+        );
+
+        assert_eq!(completion_preview(command, "al"), Some("pha".to_string()));
+        assert_eq!(completion_preview(command, "alp"), Some("ha".to_string()));
+        assert_eq!(completion_preview(command, "alpha"), None);
+        assert_eq!(completion_preview(command, "zzz"), None);
+        assert_eq!(completion_preview(command, ""), None);
+        assert_eq!(completion_preview("other-command", "al"), None);
+
+        COMPLETIONS.lock().unwrap().remove(command);
+    }
+
+    #[test]
+    fn completion_preview_skips_candidates_that_would_break_the_line() {
+        let _guard = COMPLETION_TESTS.lock().unwrap();
+        let command = "preview-multiline-command";
+        COMPLETIONS
+            .lock()
+            .unwrap()
+            .insert(command.to_string(), vec!["alpha\nbeta".to_string()]);
+
+        assert_eq!(completion_preview(command, "al"), None);
+
+        COMPLETIONS.lock().unwrap().remove(command);
     }
 
     #[test]
