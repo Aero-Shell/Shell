@@ -1,58 +1,20 @@
 # Aero Shell
-
-Ash is a super fast unix shell written in Rust
-
+Ash is a super simple shell in rust
 ```
 ➜ lucbook ~/Documents/GitHub/AeroShell ➜
 ```
-
 The command to start it is `ash` (or `aero`)
-
 ## Install
-
-One-liner (Fedora/RHEL, Debian/Ubuntu, Arch/SteamOS are autodetected):
-
+*Debian, Fedora and Arch is supported by automated installer*
 ```bash
-curl -sSL https://install.nebuff.xyz/ | bash
+curl -sSL https://install.nebuff.xyz/aeroshell | bash
 ```
-
-Or with a package manager directly:
-
-```bash
-# Fedora / RHEL
-sudo dnf install https://repo.nebuff.xyz/rpm/newest/aero-1.0.2-1.fc44.x86_64.rpm   # or via repo file:
-curl -sSL https://repo.nebuff.xyz/aero.repo | sudo tee /etc/yum.repos.d/aero.repo
-sudo dnf install aero
-
-# Debian / Ubuntu
-curl -sSL https://repo.nebuff.xyz/aero.asc | sudo tee /usr/share/keyrings/aero.asc
-curl -sSL https://repo.nebuff.xyz/aero.sources | sudo tee /etc/apt/sources.list.d/aero.sources
-sudo apt update && sudo apt install aero
-
-# Arch / SteamOS
-curl -sSL https://repo.nebuff.xyz/aero.pacman.conf.snippet | sudo tee -a /etc/pacman.conf
-sudo pacman -Sy aero
-```
-
-Packages install `/usr/bin/ash` and a `/usr/bin/aero` symlink
-
-No package manager? (containers, older devices):
-
-```bash
-curl -sSL https://repo.nebuff.xyz/releases/aero-1.0.2-linux-x86_64.tar.gz -o /tmp/aero.tgz
-mkdir -p ~/.local/bin && tar -xzf /tmp/aero.tgz -C ~/.local/bin --strip-components=2
-~/.local/bin/ash   # add ~/.local/bin to PATH if needed; 'aero' also works
-```
-
 ## Build from source
-
 Requires a Rust toolchain ([rustup.rs](https://rustup.rs)).
-
 ```bash
 cargo build --release
 ./target/release/aeroshell
 ```
-
 ## Setting Ash as your default shell
 
 Once installed via a package or `cargo build --release`, run:
@@ -108,11 +70,9 @@ history 20 | tail
 ```
 
 ### History search
-
 `Ctrl-R` opens a searchable, navigable history picker. It starts with whatever
 is already on the prompt, so `git ch` followed by `Ctrl-R` jumps straight to
 the matching commands:
-
 ```
  Ash history search                                   3/48
 > git ch
@@ -122,17 +82,6 @@ the matching commands:
   git cherry-pick HEAD~1
   1/3   ↑↓ move · enter edit · esc cancel
 ```
-
-Type to narrow the list (case-insensitive, with commands that start with the
-query listed first). Move with `↑`/`↓` or `Ctrl-P`/`Ctrl-N`, page with
-`PgUp`/`PgDn`, and jump with `Home`/`End`. `Enter` puts the selected command
-back on the prompt so it can still be edited before running; `Esc` (or
-`Ctrl-C`) restores whatever was being typed. `Ctrl-U` clears the query and
-`Ctrl-W` deletes its last word.
-
-With a partial command typed, `↑` opens the same picker filtered by that text.
-On an empty prompt, `↑` keeps its old job of walking back through history.
-
 ## Configuration
 
 Everything lives in `~/.aeroshell/`:
@@ -192,7 +141,7 @@ Delete the directory to reset Ash to defaults.
 
 Issues and PRs welcome, target the `main` branch. Keep changes small and
 matching the existing style, `cargo build` with no warnings
-
+Contributing to issues are also welcome, Take issues that **do not** have a assignee already
 ```bash
 git clone https://github.com/Aero-Shell/Shell.git AeroShell
 cd AeroShell
