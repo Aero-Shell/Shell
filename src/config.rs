@@ -91,6 +91,11 @@ impl Config {
         colors.insert("dim".into(), "\x1b[2m".into());
         colors.insert("highlight".into(), "\x1b[7m".into());
         colors.insert("autosuggestion".into(), "\x1b[38;5;244m".into());
+        colors.insert("syntax_command".into(), "\x1b[96m".into());
+        colors.insert("syntax_argument".into(), "\x1b[37m".into());
+        colors.insert("syntax_redirect".into(), "\x1b[33m".into());
+        colors.insert("syntax_pipe".into(), "\x1b[95m".into());
+        colors.insert("syntax_quote".into(), "\x1b[92m".into());
         colors.insert("orange".into(), "\x1b[38;5;208m".into());
         colors.insert("purple".into(), "\x1b[38;5;213m".into());
         colors.insert("brown".into(), "\x1b[38;5;130m".into());
@@ -593,6 +598,11 @@ mod tests {
             "ls_script",
             "bold",
             "autosuggestion",
+            "syntax_command",
+            "syntax_argument",
+            "syntax_redirect",
+            "syntax_pipe",
+            "syntax_quote",
         ] {
             assert!(cfg.colors.contains_key(key), "missing color {key}");
         }

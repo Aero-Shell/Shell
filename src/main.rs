@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use aeroshell::{config, packages, registry};
 
 mod commands;
+mod syntax_highlight;
 
 use commands::aepkg as aepkg_cmd;
 use commands::builtins;
@@ -112,6 +113,7 @@ fn quiet_exit_code(status: &ExitStatus) -> i32 {
     status.code().unwrap_or(1)
 }
 
+#[derive(Clone, Default)]
 struct HintState(Arc<AtomicBool>);
 
 impl HintState {
@@ -231,6 +233,10 @@ impl ConditionalEventHandler for AcceptHint {
 }
 
 impl Highlighter for AeroHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        Cow::Owned(syntax_highlight::highlight(line))
+    }
+
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
         &'s self,
         prompt: &'p str,
@@ -257,10 +263,8 @@ impl Highlighter for AeroHelper {
         // rustyline compute a hint again.
         if kind == CmdKind::MoveCursor && self.hint_state.shown() && pos < line.len() {
             self.hint_state.set(false);
-            true
-        } else {
-            false
         }
+        true
     }
 }
 impl rustyline::validate::Validator for AeroHelper {}
@@ -2190,7 +2194,7 @@ mod tests {
 
         assert_eq!(helper.hint("ec", 2, &ctx), Some("ho hi".into()));
         assert!(helper.hint_state.shown());
-        assert!(!helper.highlight_char("ec", 2, CmdKind::MoveCursor));
+        assert!(helper.highlight_char("ec", 2, CmdKind::MoveCursor));
         assert!(helper.highlight_char("ec", 1, CmdKind::MoveCursor));
         assert!(!helper.hint_state.shown());
     }
