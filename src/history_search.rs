@@ -1,18 +1,23 @@
-//! A searchable, navigable history picker.
+//! A compact, searchable history popup for the prompt.
 //!
 //! The REPL hands control here when the user asks for history search (Ctrl-R,
-//! or Up on a partial command). The picker filters the whole history as the
-//! query is typed, moves through the matches with the arrow keys, and hands
-//! the chosen command back to the prompt for editing.
+//! or Up on a partial command). Instead of taking over the screen, the picker
+//! draws a small popup at the prompt: up to five matching commands and one
+//! search/status line. The popup opens downwards when there is room below the
+//! prompt; at the bottom of the screen it scrolls recent output up just enough
+//! to fit above the prompt, which stays visible below it. It is removed again
+//! when a command is picked or the search is cancelled.
 //!
-//! The state machine and drawing are kept apart from the terminal layer
-//! (`pick`) so matching, navigation and layout can be tested without a TTY.
+//! The state machine and drawing are kept apart from the terminal layer so
+//! matching, navigation and layout can be tested without a TTY.
 
+use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
+use std::time::{Duration, Instant};
 
 use aeroshell::config;
 
-// Terminal styling for the picker itself, independent of the prompt theme.
+// Terminal styling for the popup itself, independent of the prompt theme.
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
@@ -20,6 +25,9 @@ const REVERSE: &str = "\x1b[7m";
 const REVERSE_OFF: &str = "\x1b[27m";
 const MATCH_ON: &str = "\x1b[1;4m";
 const MATCH_OFF: &str = "\x1b[22;24m";
+
+/// The popup shows up to this many matching commands, plus its query line.
+const MAX_MATCH_ROWS: usize = 5;
 
 /// What the user asked for with one keystroke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,15 +73,22 @@ impl Row {
     }
 }
 
-/// One rendered picker frame.
+/// One rendered popup frame.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Frame {
-    pub lines: Vec<String>,
-    /// Zero-based (row, column) where the terminal cursor belongs.
-    pub cursor: (usize, usize),
+pub struct PopupFrame {
+    /// The search/status line.
+    pub query: String,
+    /// Zero-based column where the terminal cursor belongs on the query line.
+    pub cursor_col: usize,
+    /// Match rows, top to bottom. Always exactly as many as the popup asked
+    /// for; unused rows are blank.
+    pub rows: Vec<String>,
+    /// Whether the list grows upwards towards the old output (query at the
+    /// bottom, just above the prompt).
+    pub upward: bool,
 }
 
-/// The picker's state machine: query, matches, selection and scrolling.
+/// The popup's state machine: query, matches, selection and scrolling.
 pub struct HistoryPicker {
     rows: Vec<Row>,
     matching: Vec<usize>,
@@ -98,7 +113,7 @@ impl HistoryPicker {
             query: initial.to_string(),
             selected: 0,
             offset: 0,
-            page: 10,
+            page: 1,
         };
         picker.refilter();
         picker
@@ -220,108 +235,118 @@ impl HistoryPicker {
         self.move_selection(step);
     }
 
-    /// Draw one frame. `height` includes the header, query line, separator and
-    /// footer; whatever is left is the scrolling match window. Visible lines
-    /// never exceed `width` columns, so the frame cannot wrap and damage the
-    /// full-screen layout.
-    pub fn render(&mut self, width: usize, height: usize, color: bool) -> Frame {
+    /// Draw the match area and query line. `match_rows` is the number of
+    /// matching commands the popup has room for; the query/status line is
+    /// drawn separately by the caller. `upward` reverses the visual order so
+    /// the newest visible match sits closest to the query line at the bottom.
+    pub fn frame(
+        &mut self,
+        width: usize,
+        match_rows: usize,
+        upward: bool,
+        color: bool,
+    ) -> PopupFrame {
         let width = width.max(1);
-        let height = height.max(1);
+        let match_rows = match_rows.max(1);
+        self.page = match_rows;
+        self.ensure_visible(match_rows);
 
-        let mut lines: Vec<String> = Vec::with_capacity(height);
-        if height >= 4 {
-            lines.push(self.header_line(width, color));
-        }
-        let query_row = lines.len();
-        let (query_line, cursor_col) = self.query_line(width, color);
-        lines.push(query_line);
-        if height >= 3 {
-            lines.push(self.separator_line(width, color));
-        }
-
-        let footer_reserved = height > lines.len();
-        let list_rows = height.saturating_sub(lines.len() + usize::from(footer_reserved));
-        self.page = list_rows;
-
-        if list_rows > 0 {
-            self.ensure_visible(list_rows);
-            let mut drawn = 0;
-            for slot in 0..list_rows {
-                if let Some(&index) = self.matching.get(self.offset + slot) {
-                    let selected = self.offset + slot == self.selected;
-                    lines.push(self.row_line(&self.rows[index], selected, width, color));
-                    drawn += 1;
-                } else if slot == 0 && self.matching.is_empty() {
-                    let message = if self.rows.is_empty() {
-                        "  no history yet"
-                    } else {
-                        "  no matching commands"
-                    };
-                    lines.push(style(fit(message, width), DIM, color));
-                    drawn += 1;
-                } else {
-                    break;
-                }
+        let mut rows: Vec<String> = if self.matching.is_empty() {
+            let message = if self.rows.is_empty() {
+                "  no history yet"
+            } else {
+                "  no matching commands"
+            };
+            let message = style(fit(message, width), DIM, color);
+            let mut rows = vec![String::new(); match_rows];
+            if upward {
+                rows[match_rows - 1] = message;
+            } else {
+                rows[0] = message;
             }
-            // Keep the frame exactly `height` rows so nothing stale is left
-            // behind when a later frame is shorter.
-            for _ in drawn..list_rows {
-                lines.push(String::new());
+            rows
+        } else {
+            let end = (self.offset + match_rows).min(self.matching.len());
+            let mut lines: Vec<String> = (self.offset..end)
+                .map(|matching_index| {
+                    let row = &self.rows[self.matching[matching_index]];
+                    self.row_line(row, matching_index == self.selected, width, color)
+                })
+                .collect();
+            if upward {
+                lines.reverse();
+                let mut padded = vec![String::new(); match_rows - lines.len()];
+                padded.extend(lines);
+                padded
+            } else {
+                lines.resize(match_rows, String::new());
+                lines
             }
-        }
+        };
+        rows.truncate(match_rows);
 
-        if footer_reserved {
-            lines.push(self.footer_line(width, color));
-        }
-        while lines.len() < height {
-            lines.push(String::new());
-        }
-        lines.truncate(height);
-
-        Frame {
-            lines,
-            cursor: (query_row, cursor_col),
+        let (query, cursor_col) = self.query_line(width, color);
+        PopupFrame {
+            query,
+            cursor_col,
+            rows,
+            upward,
         }
     }
 
-    fn ensure_visible(&mut self, list_rows: usize) {
-        let list_rows = list_rows.max(1);
+    fn ensure_visible(&mut self, match_rows: usize) {
+        let match_rows = match_rows.max(1);
         if self.selected < self.offset {
             self.offset = self.selected;
         }
-        if self.selected >= self.offset + list_rows {
-            self.offset = self.selected + 1 - list_rows;
+        if self.selected >= self.offset + match_rows {
+            self.offset = self.selected + 1 - match_rows;
         }
-        let max_offset = self.matching.len().saturating_sub(list_rows);
+        let max_offset = self.matching.len().saturating_sub(match_rows);
         self.offset = self.offset.min(max_offset);
     }
 
-    fn header_line(&self, width: usize, color: bool) -> String {
-        let title = " Ash history search ";
-        let counts = format!("{}/{} ", self.matching.len(), self.rows.len());
-        if title.chars().count() + counts.chars().count() <= width {
-            let padding = width - title.chars().count() - counts.chars().count();
-            style(
-                format!("{title}{}{counts}", " ".repeat(padding)),
-                BOLD,
-                color,
-            )
-        } else {
-            style(fit(&format!("{title}{counts}"), width), BOLD, color)
-        }
-    }
-
+    /// `> query` on the left and the position/help on the right. The query is
+    /// cropped from the left when it is too long for the space available.
     fn query_line(&self, width: usize, color: bool) -> (String, usize) {
         let prefix = if width >= 2 { "> " } else { "" };
-        let available = width - prefix.chars().count();
+        let prefix_width = prefix.chars().count();
+        let position = if self.matching.is_empty() {
+            "0/0".to_string()
+        } else {
+            format!("{}/{}", self.selected + 1, self.matching.len())
+        };
+        let mut status = if width >= 36 {
+            format!("{position}  \u{2191}\u{2193}  enter  esc")
+        } else if width >= 10 {
+            position
+        } else {
+            String::new()
+        };
+        let mut status_width = status.chars().count();
+        // Keep at least one column between the query and the status.
+        if status_width > 0 && width <= prefix_width + status_width + 1 {
+            status.clear();
+            status_width = 0;
+        }
+        let reserved = if status_width > 0 {
+            status_width + 1
+        } else {
+            0
+        };
+        let available = width.saturating_sub(prefix_width + reserved);
         let total = self.query.chars().count();
         let shown: String = if total <= available {
             self.query.clone()
+        } else if available == 0 {
+            String::new()
         } else {
-            // Keep the end of a long query visible, like a text field.
             self.query.chars().skip(total - available).collect()
         };
-        let cursor = (prefix.chars().count() + shown.chars().count()).min(width - 1);
+        let shown_width = shown.chars().count();
+        let left_width = prefix_width + shown_width;
+        let gap = width.saturating_sub(left_width + status_width);
+
         let mut line = String::new();
         if color && !prefix.is_empty() {
             line.push_str(BOLD);
@@ -331,22 +356,12 @@ impl HistoryPicker {
             line.push_str(prefix);
         }
         line.push_str(&shown);
+        line.push_str(&" ".repeat(gap));
+        if !status.is_empty() {
+            line.push_str(&style(status, DIM, color));
+        }
+        let cursor = left_width.min(width.saturating_sub(1));
         (line, cursor)
-    }
-
-    fn separator_line(&self, width: usize, color: bool) -> String {
-        style("─".repeat(width), DIM, color)
-    }
-
-    fn footer_line(&self, width: usize, color: bool) -> String {
-        let position = if self.matching.is_empty() {
-            "0/0".to_string()
-        } else {
-            format!("{}/{}", self.selected + 1, self.matching.len())
-        };
-        let text =
-            format!("  {position}   \u{2191}\u{2193} move \u{00b7} enter edit \u{00b7} esc cancel");
-        style(fit(&text, width), DIM, color)
     }
 
     fn row_line(&self, row: &Row, selected: bool, width: usize, color: bool) -> String {
@@ -398,27 +413,54 @@ pub enum Picked {
     Unavailable,
 }
 
-/// Run the picker on the terminal. Returns `Unavailable` when there is nothing
-/// to search or stdin/stdout are not a TTY, so the caller can keep the normal
-/// prompt without opening an empty screen.
-pub fn pick(entries: Vec<String>, initial: &str) -> Picked {
-    if entries.is_empty() || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+/// Run the popup on the terminal. Returns `Unavailable` when stdin/stdout are
+/// not a TTY or the terminal is too small to show even one match, so the
+/// caller can keep the normal prompt.
+pub fn pick(entries: Vec<String>, initial: &str, prompt: &str, hint_len: usize) -> Picked {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Picked::Unavailable;
     }
     let Some(mut terminal) = Terminal::enter() else {
         return Picked::Unavailable;
     };
+    let (width, height) = terminal_size();
+    if width < 2 || height < 2 {
+        return Picked::Unavailable;
+    }
+
+    // Leave one row for the query line. The prompt itself already has the row
+    // it was drawn on, so the popup may use up to `height - 1` match rows.
+    let match_rows = (height - 2).clamp(1, MAX_MATCH_ROWS);
+    // After rustyline finishes interrupting the line it leaves the cursor on
+    // the row below the prompt. Ask the terminal where that is; when it does
+    // not answer, assume the prompt is at the bottom (one row above the
+    // cursor).
+    let cursor_row = terminal.cursor_position().map_or(height, |(row, _)| row);
+    let last_prompt_row = prompt_row_from_cursor(cursor_row, height);
+    // A long prompt (or a hint) can wrap over several rows. Anchor the popup
+    // on the first one and clear the whole block, so the resumed prompt does
+    // not leave a stale first line behind.
+    let prompt_rows = prompt_height(prompt, initial, hint_len, width);
+    let prompt_row = last_prompt_row.saturating_sub(prompt_rows - 1);
+    let layout = layout(height, prompt_row, match_rows);
+    let prompt_display = format!("{prompt}{initial}");
+    if !terminal.setup(layout, prompt_row, prompt_rows, height, &prompt_display) {
+        return Picked::Unavailable;
+    }
+
     let color = config::active_config().map(|cfg| cfg.color).unwrap_or(true);
     let mut picker = HistoryPicker::new(entries, initial);
     loop {
-        let (width, height) = terminal_size();
-        let frame = picker.render(width, height, color);
+        let frame = picker.frame(width, match_rows, layout.upward, color);
         if terminal.draw(&frame).is_err() {
             return Picked::Cancelled;
         }
         let Ok(key) = terminal.read_key() else {
             return Picked::Cancelled;
         };
+        // In the upward layout the list is drawn in reverse, so the same
+        // physical key has to move the selection the other way.
+        let key = orient_key(key, layout.upward);
         match picker.handle(key) {
             Action::Continue => {}
             Action::Accept(entry) => return Picked::Entry(entry),
@@ -427,44 +469,123 @@ pub fn pick(entries: Vec<String>, initial: &str) -> Picked {
     }
 }
 
-/// Clear the prompt line that the picker interrupted, so the resumed prompt
-/// replaces it instead of leaving a stale copy in the transcript. Only acts
-/// when the prompt and its text fit on one terminal row; a wrapped or
-/// multi-line edit is left exactly as the line editor drew it.
-pub fn erase_prompt_line(prompt: &str, line: &str, hint_len: usize) {
-    if line.contains('\n') || prompt.contains('\n') {
-        return;
-    }
-    let (width, _) = terminal_size();
-    if visible_width(prompt) + line.chars().count() + hint_len >= width {
-        return;
-    }
-    let mut stdout = io::stdout();
-    let _ = stdout.write_all(b"\x1b[1A\r\x1b[2K");
-    let _ = stdout.flush();
+/// Where the popup's rows live and whether the screen had to scroll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Layout {
+    /// Matches above the query line (the screen was scrolled up to make room).
+    upward: bool,
+    /// The prompt is left below the popup and has to be redrawn while the
+    /// picker is open.
+    prompt_visible: bool,
+    /// Lines the screen was scrolled up by; undone when the popup closes.
+    scrolled: usize,
+    /// First and last (inclusive) terminal row covered by the popup.
+    popup_start: usize,
+    popup_end: usize,
+    /// Row of the query/status line.
+    query_row: usize,
+    /// First row of the match area.
+    match_start: usize,
 }
 
-/// Width of `text` on screen, ignoring ANSI escape sequences.
-fn visible_width(text: &str) -> usize {
-    let mut width = 0;
+/// Number of terminal rows taken by the prompt, the text being edited and the
+/// inline hint that follows it. ANSI colour sequences do not take space.
+fn prompt_height(prompt: &str, line: &str, hint_len: usize, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let mut rows = 1usize;
+    let mut column = 0usize;
     let mut escape = false;
-    for character in text.chars() {
+    for character in prompt.chars().chain(line.chars()) {
         if escape {
             if character.is_ascii_alphabetic() {
                 escape = false;
             }
         } else if character == '\x1b' {
             escape = true;
+        } else if character == '\n' {
+            rows += 1;
+            column = 0;
         } else {
-            width += 1;
+            column += 1;
+            while column > width {
+                rows += 1;
+                column -= width;
+            }
         }
     }
-    width
+    column += hint_len;
+    while column > width {
+        rows += 1;
+        column -= width;
+    }
+    rows
 }
 
-/// Raw mode plus the alternate screen, restored on drop (including panics).
+/// Convert the 1-based cursor row reported by the terminal into the 0-based
+/// row of the prompt that was just interrupted. Rustyline prints a newline
+/// after the interrupted prompt, leaving the cursor one row below it; the
+/// other row is the 1-based to 0-based conversion.
+fn prompt_row_from_cursor(cursor_row: usize, height: usize) -> usize {
+    cursor_row.saturating_sub(2).min(height.saturating_sub(1))
+}
+
+/// Work out where a `match_rows`-tall list plus its query line can go without
+/// covering any more output than necessary. Rows are zero-based.
+fn layout(height: usize, prompt_row: usize, match_rows: usize) -> Layout {
+    let popup_rows = match_rows + 1;
+    if prompt_row + popup_rows <= height {
+        // There is room below the prompt: replace the prompt line with the
+        // query and grow downwards.
+        Layout {
+            upward: false,
+            prompt_visible: false,
+            scrolled: 0,
+            popup_start: prompt_row,
+            popup_end: prompt_row + match_rows,
+            query_row: prompt_row,
+            match_start: prompt_row + 1,
+        }
+    } else if prompt_row >= popup_rows {
+        // Near the bottom: scroll the output up so the whole popup fits above
+        // the prompt, then redraw the prompt below it. The prompt stays where
+        // the user left it and the matches are above the search line.
+        Layout {
+            upward: true,
+            prompt_visible: true,
+            scrolled: popup_rows,
+            popup_start: prompt_row - popup_rows,
+            popup_end: prompt_row - 1,
+            query_row: prompt_row - 1,
+            match_start: prompt_row - popup_rows,
+        }
+    } else {
+        // Tiny terminal: there is no room for both the popup and the prompt.
+        // Fall back to scrolling the prompt out of the way and putting the
+        // query line at the bottom.
+        let start = height - 1 - match_rows;
+        let scrolled = prompt_row.saturating_sub(start);
+        Layout {
+            upward: true,
+            prompt_visible: false,
+            scrolled,
+            popup_start: start,
+            popup_end: height - 1,
+            query_row: height - 1,
+            match_start: start,
+        }
+    }
+}
+
+/// Raw mode and a hidden cursor, restored on drop (including panics).
 struct Terminal {
     original: libc::termios,
+    geometry: Option<Layout>,
+    prompt_row: usize,
+    prompt_rows: usize,
+    /// Bytes read while waiting for a cursor-position reply, replayed as keys.
+    pending: VecDeque<u8>,
 }
 
 impl Terminal {
@@ -475,28 +596,124 @@ impl Terminal {
         }
         let mut raw = original;
         unsafe { libc::cfmakeraw(&mut raw) };
-        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw) } != 0 {
+        // Do not flush pending input: a fast typist may already have typed the
+        // first letters of the query while the popup was opening. Those bytes
+        // are replayed through `pending` after the cursor-position query.
+        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
             return None;
         }
-        let mut stdout = io::stdout();
-        let _ = stdout.write_all(b"\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J");
-        let _ = stdout.flush();
-        Some(Self { original })
+        let _ = io::stdout().write_all(b"\x1b[?25l");
+        let _ = io::stdout().flush();
+        Some(Self {
+            original,
+            geometry: None,
+            prompt_row: 0,
+            prompt_rows: 0,
+            pending: VecDeque::new(),
+        })
     }
 
-    fn draw(&mut self, frame: &Frame) -> io::Result<()> {
-        let mut out = String::from("\x1b[?25l\x1b[H");
-        for (index, line) in frame.lines.iter().enumerate() {
-            out.push_str("\x1b[2K");
-            out.push_str(line);
-            if index + 1 < frame.lines.len() {
-                out.push_str("\r\n");
+    /// Ask the terminal for the cursor position (`CSI 6n`). Best effort: if
+    /// nothing sensible comes back within a short window, the caller falls
+    /// back to assuming the prompt is at the bottom of the screen.
+    fn cursor_position(&mut self) -> Option<(usize, usize)> {
+        let mut stdout = io::stdout();
+        stdout.write_all(b"\x1b[6n").ok()?;
+        stdout.flush().ok()?;
+
+        let deadline = Instant::now() + Duration::from_millis(120);
+        let mut bytes = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let timeout = (remaining.as_millis().min(20)) as i32;
+            if !wait_readable(timeout) {
+                continue;
+            }
+            let Ok(byte) = read_byte() else {
+                break;
+            };
+            bytes.push(byte);
+            if byte == b'R' {
+                break;
             }
         }
+        if let Some((start, position)) = cursor_reply(&bytes) {
+            // Anything read before the reply is user input; keep it for the
+            // picker instead of dropping the first characters typed.
+            for byte in bytes[..start].iter().rev() {
+                self.pending.push_front(*byte);
+            }
+            return Some(position);
+        }
+        for byte in bytes.into_iter().rev() {
+            self.pending.push_front(byte);
+        }
+        None
+    }
+
+    /// Scroll (if needed), remember the popup geometry, and clear the rows it
+    /// will occupy as well as any remaining rows of a wrapped prompt.
+    fn setup(
+        &mut self,
+        layout: Layout,
+        prompt_row: usize,
+        prompt_rows: usize,
+        height: usize,
+        prompt_display: &str,
+    ) -> bool {
+        if layout.scrolled > 0 {
+            let mut stdout = io::stdout();
+            if stdout
+                .write_all(format!("\x1b[{}S", layout.scrolled).as_bytes())
+                .and_then(|()| stdout.flush())
+                .is_err()
+            {
+                return false;
+            }
+        }
+        self.geometry = Some(layout);
+        self.prompt_row = prompt_row;
+        self.prompt_rows = prompt_rows;
+        let end = layout
+            .popup_end
+            .max(prompt_row + prompt_rows - 1)
+            .min(height - 1);
+        let mut out = String::new();
+        for row in layout.popup_start..=end {
+            out.push_str(&format!("\x1b[{};1H\x1b[2K", row + 1));
+        }
+        if layout.prompt_visible {
+            out.push_str(&format!("\x1b[{};1H\x1b[2K", prompt_row + 1));
+            out.push_str(prompt_display);
+        }
+        let mut stdout = io::stdout();
+        stdout
+            .write_all(out.as_bytes())
+            .and_then(|()| stdout.flush())
+            .is_ok()
+    }
+
+    fn draw(&mut self, frame: &PopupFrame) -> io::Result<()> {
+        let Some(layout) = self.geometry else {
+            return Ok(());
+        };
+        let mut out = String::from("\x1b[?25l");
+        for (offset, line) in frame.rows.iter().enumerate() {
+            let row = layout.match_start + offset;
+            out.push_str(&format!("\x1b[{};1H\x1b[2K{line}", row + 1));
+        }
+        out.push_str(&format!(
+            "\x1b[{};1H\x1b[2K{}",
+            layout.query_row + 1,
+            frame.query
+        ));
         out.push_str(&format!(
             "\x1b[{};{}H\x1b[?25h",
-            frame.cursor.0 + 1,
-            frame.cursor.1 + 1
+            layout.query_row + 1,
+            frame.cursor_col + 1
         ));
         let mut stdout = io::stdout();
         stdout.write_all(out.as_bytes())?;
@@ -504,7 +721,7 @@ impl Terminal {
     }
 
     fn read_key(&mut self) -> io::Result<Key> {
-        let byte = read_byte()?;
+        let byte = self.next_byte()?;
         match byte {
             b'\x1b' => self.read_escape(),
             0x03 | 0x07 | 0x04 => Ok(Key::Cancel), // Ctrl-C, Ctrl-G, Ctrl-D
@@ -521,13 +738,11 @@ impl Terminal {
         }
     }
 
-    /// Parse the rest of an escape sequence. A lone Esc cancels; terminal
-    /// arrows and paging keys arrive as CSI/SS3 sequences.
     fn read_escape(&mut self) -> io::Result<Key> {
-        if !wait_readable(20) {
+        if self.pending.is_empty() && !wait_readable(20) {
             return Ok(Key::Cancel);
         }
-        let first = read_byte()?;
+        let first = self.next_byte()?;
         match first {
             b'[' => {
                 let mut sequence = vec![b'['];
@@ -535,7 +750,7 @@ impl Terminal {
                     if sequence.len() > 8 {
                         return Ok(Key::Ignore);
                     }
-                    let byte = read_byte()?;
+                    let byte = self.next_byte()?;
                     sequence.push(byte);
                     if (0x40..=0x7e).contains(&byte) {
                         break;
@@ -552,7 +767,7 @@ impl Terminal {
                 })
             }
             b'O' => {
-                let byte = read_byte()?;
+                let byte = self.next_byte()?;
                 Ok(match byte {
                     b'A' => Key::Up,
                     b'B' => Key::Down,
@@ -574,24 +789,87 @@ impl Terminal {
         };
         let mut bytes = vec![first];
         for _ in 0..extra {
-            bytes.push(read_byte()?);
+            bytes.push(self.next_byte()?);
         }
         Ok(std::str::from_utf8(&bytes)
             .ok()
             .and_then(|text| text.chars().next())
             .map_or(Key::Ignore, Key::Char))
     }
+
+    fn next_byte(&mut self) -> io::Result<u8> {
+        match self.pending.pop_front() {
+            Some(byte) => Ok(byte),
+            None => read_byte(),
+        }
+    }
+
+    /// Remove the popup, undo the scroll, and put the cursor where the prompt
+    /// should be redrawn.
+    fn cleanup(&mut self) {
+        let Some(layout) = self.geometry.take() else {
+            let _ = io::stdout().write_all(b"\x1b[?25h");
+            let _ = io::stdout().flush();
+            return;
+        };
+        let mut out = String::new();
+        for row in layout.popup_start..=layout.popup_end {
+            out.push_str(&format!("\x1b[{};1H\x1b[2K", row + 1));
+        }
+        if layout.prompt_visible {
+            for row in self.prompt_row..self.prompt_row + self.prompt_rows {
+                out.push_str(&format!("\x1b[{};1H\x1b[2K", row + 1));
+            }
+        }
+        if layout.scrolled > 0 {
+            out.push_str(&format!("\x1b[{}T", layout.scrolled));
+        }
+        out.push_str(&format!("\x1b[{};1H\x1b[2K\x1b[?25h", self.prompt_row + 1));
+        let mut stdout = io::stdout();
+        let _ = stdout.write_all(out.as_bytes());
+        let _ = stdout.flush();
+    }
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        let mut stdout = io::stdout();
-        let _ = stdout.write_all(b"\x1b[?25h\x1b[?1049l");
-        let _ = stdout.flush();
+        self.cleanup();
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &self.original);
         }
     }
+}
+
+/// Locate a cursor-position reply inside the bytes read while waiting for it.
+/// Returns the reply's offset and `(row, column)`; any bytes before it are
+/// typed input that still has to be handled.
+fn cursor_reply(bytes: &[u8]) -> Option<(usize, (usize, usize))> {
+    for start in 0..bytes.len() {
+        if bytes[start] == 0x1b
+            && bytes.get(start + 1) == Some(&b'[')
+            && let Some(position) = parse_cursor_position(&bytes[start..])
+        {
+            return Some((start, position));
+        }
+    }
+    None
+}
+
+fn parse_cursor_position(bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut index = 0;
+    while index + 2 < bytes.len() {
+        if bytes[index] == 0x1b && bytes[index + 1] == b'[' {
+            let rest = &bytes[index + 2..];
+            let end = rest.iter().position(|&byte| byte == b'R')?;
+            let body = std::str::from_utf8(&rest[..end]).ok()?;
+            let (row, column) = body.split_once(';')?;
+            let row = row.parse().ok()?;
+            let column = column.parse().ok()?;
+            return Some((row, column));
+        }
+        index += 1;
+    }
+    None
 }
 
 fn terminal_size() -> (usize, usize) {
@@ -640,6 +918,22 @@ fn wait_readable(timeout_ms: i32) -> bool {
         if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
             return false;
         }
+    }
+}
+
+/// Map vertical movement keys to the visual direction of the popup. The
+/// downward layout draws the newest match at the top; the upward layout draws
+/// it at the bottom, directly above the query line.
+fn orient_key(key: Key, upward: bool) -> Key {
+    if !upward {
+        return key;
+    }
+    match key {
+        Key::Up => Key::Down,
+        Key::Down => Key::Up,
+        Key::PageUp => Key::PageDown,
+        Key::PageDown => Key::PageUp,
+        other => other,
     }
 }
 
@@ -743,9 +1037,9 @@ mod tests {
         out
     }
 
-    fn body(frame: &Frame) -> String {
+    fn body(frame: &PopupFrame) -> String {
         frame
-            .lines
+            .rows
             .iter()
             .map(|line| plain(line))
             .collect::<Vec<_>>()
@@ -758,10 +1052,10 @@ mod tests {
         assert_eq!(picker.match_count(), 3);
         assert_eq!(picker.selected_entry(), Some("new"));
 
-        let frame = picker.render(40, 8, false);
-        let text = body(&frame);
-        assert!(text.find("new").unwrap() < text.find("middle").unwrap());
-        assert!(text.find("middle").unwrap() < text.find("old").unwrap());
+        let frame = picker.frame(40, 3, false, false);
+        assert!(plain(&frame.rows[0]).starts_with("> new"));
+        assert!(plain(&frame.rows[1]).starts_with("  middle"));
+        assert!(plain(&frame.rows[2]).starts_with("  old"));
     }
 
     #[test]
@@ -788,6 +1082,17 @@ mod tests {
     }
 
     #[test]
+    fn upward_layout_flips_vertical_keys() {
+        assert_eq!(orient_key(Key::Up, true), Key::Down);
+        assert_eq!(orient_key(Key::Down, true), Key::Up);
+        assert_eq!(orient_key(Key::PageUp, true), Key::PageDown);
+        assert_eq!(orient_key(Key::PageDown, true), Key::PageUp);
+        assert_eq!(orient_key(Key::Up, false), Key::Up);
+        assert_eq!(orient_key(Key::PageDown, false), Key::PageDown);
+        assert_eq!(orient_key(Key::Home, true), Key::Home);
+    }
+
+    #[test]
     fn navigation_stops_at_the_ends() {
         let mut picker = picker(&["one", "two", "three"]);
         assert_eq!(picker.selected(), 0);
@@ -806,16 +1111,16 @@ mod tests {
     fn page_and_home_end_keys_move_selection() {
         let entries: Vec<String> = (0..30).map(|n| format!("entry {n}")).collect();
         let mut picker = HistoryPicker::new(entries, "");
-        // Height 10 leaves six list rows: header, query, separator, footer.
-        picker.render(40, 10, false);
-        assert_eq!(picker.page, 6);
+        // Five match rows plus the query line is the usual popup size.
+        picker.frame(40, 5, false, false);
+        assert_eq!(picker.page, 5);
 
         picker.handle(Key::PageDown);
-        assert_eq!(picker.selected(), 6);
+        assert_eq!(picker.selected(), 5);
         picker.handle(Key::PageDown);
-        assert_eq!(picker.selected(), 12);
+        assert_eq!(picker.selected(), 10);
         picker.handle(Key::PageUp);
-        assert_eq!(picker.selected(), 6);
+        assert_eq!(picker.selected(), 5);
         picker.handle(Key::End);
         assert_eq!(picker.selected(), 29);
         picker.handle(Key::Home);
@@ -826,10 +1131,10 @@ mod tests {
     fn changing_the_query_resets_selection_and_scroll() {
         let entries: Vec<String> = (0..30).map(|n| format!("cmd {n}")).collect();
         let mut picker = HistoryPicker::new(entries, "");
-        picker.render(40, 10, false);
+        picker.frame(40, 5, false, false);
         picker.handle(Key::PageDown);
-        assert_eq!(picker.selected(), 6);
-        picker.render(40, 10, false);
+        assert_eq!(picker.selected(), 5);
+        picker.frame(40, 5, false, false);
         assert_eq!(picker.offset(), 1);
 
         picker.handle(Key::Char('c'));
@@ -895,18 +1200,54 @@ mod tests {
     }
 
     #[test]
+    fn downward_frame_puts_the_newest_match_first() {
+        let mut picker = picker(&["old", "middle", "new"]);
+        let frame = picker.frame(40, 3, false, false);
+        assert!(!frame.upward);
+        assert!(plain(&frame.rows[0]).starts_with("> new"));
+        assert!(plain(&frame.rows[1]).starts_with("  middle"));
+        assert!(plain(&frame.rows[2]).starts_with("  old"));
+    }
+
+    #[test]
+    fn upward_frame_puts_the_newest_match_nearest_the_query() {
+        let mut picker = picker(&["old", "middle", "new"]);
+        let frame = picker.frame(40, 3, true, false);
+        assert!(frame.upward);
+        // Rows are top-to-bottom; the selected/newest entry is at the bottom,
+        // closest to the query line.
+        assert!(plain(&frame.rows[0]).starts_with("  old"));
+        assert!(plain(&frame.rows[1]).starts_with("  middle"));
+        assert!(plain(&frame.rows[2]).starts_with("> new"));
+    }
+
+    #[test]
+    fn unused_match_rows_are_padded_away_from_the_query() {
+        let mut picker = picker(&["one", "two"]);
+        let downward = picker.frame(40, 4, false, false);
+        assert_eq!(plain(&downward.rows[2]), "");
+        assert_eq!(plain(&downward.rows[3]), "");
+
+        let upward = picker.frame(40, 4, true, false);
+        assert_eq!(plain(&upward.rows[0]), "");
+        assert_eq!(plain(&upward.rows[1]), "");
+        assert!(plain(&upward.rows[2]).starts_with("  one"));
+        assert!(plain(&upward.rows[3]).starts_with("> two"));
+    }
+
+    #[test]
     fn render_marks_the_selected_row_and_highlights_the_query() {
         let mut picker = picker(&["git status", "git log"]);
         for character in "git".chars() {
             picker.handle(Key::Char(character));
         }
-        let frame = picker.render(60, 8, true);
-        let selected = &frame.lines[3];
+        let frame = picker.frame(60, 2, false, true);
+        let selected = &frame.rows[0];
         assert!(selected.contains(REVERSE));
         assert!(selected.contains(MATCH_ON));
         assert!(plain(selected).starts_with("> git log"));
 
-        let unselected = &frame.lines[4];
+        let unselected = &frame.rows[1];
         assert!(!unselected.contains(REVERSE));
         assert!(plain(unselected).starts_with("  git status"));
     }
@@ -914,10 +1255,16 @@ mod tests {
     #[test]
     fn color_free_render_uses_a_marker_for_selection() {
         let mut picker = picker(&["git status", "git log"]);
-        let frame = picker.render(60, 8, false);
-        assert!(!frame.lines.iter().any(|line| line.contains('\x1b')));
-        assert!(frame.lines[3].starts_with("> git log"));
-        assert!(frame.lines[4].starts_with("  git status"));
+        for upward in [false, true] {
+            let frame = picker.frame(60, 2, upward, false);
+            assert!(!frame.rows.iter().any(|line| line.contains('\x1b')));
+            let selected = if upward {
+                &frame.rows[1]
+            } else {
+                &frame.rows[0]
+            };
+            assert!(selected.starts_with("> git log"));
+        }
     }
 
     #[test]
@@ -926,36 +1273,62 @@ mod tests {
         let mut picker = picker(&[long.as_str(), "short"]);
         picker.handle(Key::Char('x'));
         for width in [1, 2, 5, 20, 79] {
-            let frame = picker.render(width, 10, true);
-            for line in &frame.lines {
+            for upward in [false, true] {
+                let frame = picker.frame(width, 5, upward, true);
                 assert!(
-                    plain(line).chars().count() <= width,
-                    "line {line:?} exceeds width {width}"
+                    plain(&frame.query).chars().count() <= width,
+                    "query {frame:?} exceeds width {width}"
                 );
+                for line in &frame.rows {
+                    assert!(
+                        plain(line).chars().count() <= width,
+                        "line {line:?} exceeds width {width}"
+                    );
+                }
+                assert!(frame.cursor_col < width.max(1));
             }
-            assert!(frame.cursor.1 < width.max(1));
         }
     }
 
     #[test]
-    fn long_queries_show_their_tail() {
-        let mut picker = picker(&["unrelated"]);
+    fn query_line_shows_position_and_help() {
+        let mut picker = picker(&["one", "two", "three"]);
+        let wide = picker.frame(60, 3, false, false);
+        assert!(plain(&wide.query).contains("1/3"));
+        assert!(plain(&wide.query).contains("enter"));
+        assert!(plain(&wide.query).contains("esc"));
+
+        let medium = picker.frame(14, 3, false, false);
+        assert!(plain(&medium.query).contains("1/3"));
+        assert!(!plain(&medium.query).contains("enter"));
+
+        let narrow = picker.frame(8, 3, false, false);
+        assert_eq!(plain(&narrow.query).chars().count(), 8);
+    }
+
+    #[test]
+    fn query_line_keeps_the_tail_of_a_long_query() {
+        let mut picker = picker(&["abcdefghijklmnopqrstuvwxyz"]);
         for character in "abcdefghijklmnopqrstuvwxyz".chars() {
             picker.handle(Key::Char(character));
         }
-        let frame = picker.render(12, 6, false);
-        let query_line = plain(&frame.lines[1]);
-        assert!(query_line.starts_with("> "));
-        assert!(query_line.ends_with("xyz"));
-        assert_eq!(frame.cursor, (1, 11));
+        let frame = picker.frame(12, 4, false, false);
+        let query = plain(&frame.query);
+        // Six columns are left for the query after the prompt and the 1/1
+        // status; the tail of the query is what stays visible.
+        assert!(query.starts_with("> uvwxyz"));
+        assert!(query.ends_with("1/1"));
+        assert_eq!(frame.cursor_col, 8);
     }
 
     #[test]
-    fn frames_are_exactly_the_terminal_height() {
+    fn frames_are_exactly_as_tall_as_requested() {
         let mut picker = picker(&["one", "two"]);
-        for height in 1..=12 {
-            let frame = picker.render(40, height, false);
-            assert_eq!(frame.lines.len(), height, "height {height}");
+        for rows in 1..=8 {
+            for upward in [false, true] {
+                let frame = picker.frame(40, rows, upward, false);
+                assert_eq!(frame.rows.len(), rows);
+            }
         }
     }
 
@@ -964,21 +1337,27 @@ mod tests {
         let entries: Vec<String> = (0..100).map(|n| format!("cmd {n:02}")).collect();
         let mut picker = HistoryPicker::new(entries, "");
         picker.handle(Key::End);
-        let frame = picker.render(40, 8, false);
-        let text = body(&frame);
-        assert!(text.contains("> cmd 00"));
+        let frame = picker.frame(40, 4, false, false);
+        assert!(body(&frame).contains("> cmd 00"));
         assert_eq!(picker.offset(), 96);
 
         picker.handle(Key::Home);
-        let frame = picker.render(40, 8, false);
+        let frame = picker.frame(40, 4, false, false);
         assert!(body(&frame).contains("> cmd 99"));
         assert_eq!(picker.offset(), 0);
+
+        // The same holds when the list is drawn upwards. The oldest visible
+        // entries are at the top, so the selected oldest entry is row 0.
+        picker.handle(Key::End);
+        let frame = picker.frame(40, 4, true, false);
+        assert!(body(&frame).contains("> cmd 00"));
+        assert!(plain(&frame.rows[0]).starts_with("> cmd 00"));
     }
 
     #[test]
     fn newlines_are_flattened_and_control_characters_dropped() {
         let mut picker = picker(&["echo hi\nthere", "esc \x1b[31mred"]);
-        let frame = picker.render(60, 8, false);
+        let frame = picker.frame(60, 3, false, false);
         let text = body(&frame);
         assert!(text.contains("echo hi \u{23ce} there"));
         assert!(!text.contains('\x1b'));
@@ -986,31 +1365,22 @@ mod tests {
     }
 
     #[test]
-    fn no_matches_shows_a_message_and_zero_counts() {
+    fn no_matches_message_sits_next_to_the_query() {
         let mut picker = picker_with(&["git status"], "zzz");
-        let frame = picker.render(50, 8, false);
-        let text = body(&frame);
-        assert!(text.contains("no matching commands"));
-        assert!(text.contains("0/0"));
-        assert!(text.contains("0/1"));
+        let downward = picker.frame(50, 3, false, false);
+        assert!(plain(&downward.rows[0]).contains("no matching commands"));
+        assert!(plain(&downward.query).contains("0/0"));
+
+        let upward = picker.frame(50, 3, true, false);
+        assert!(plain(&upward.rows[2]).contains("no matching commands"));
     }
 
     #[test]
     fn empty_history_is_reported_in_the_ui() {
         let mut picker = picker(&[]);
-        let frame = picker.render(50, 8, false);
+        let frame = picker.frame(50, 3, false, false);
         assert!(body(&frame).contains("no history yet"));
         assert_eq!(picker.handle(Key::Enter), Action::Continue);
-    }
-
-    #[test]
-    fn header_and_footer_show_counts_and_help() {
-        let mut picker = picker(&["one", "two", "three"]);
-        let frame = picker.render(60, 8, false);
-        assert!(body(&frame).contains("3/3"));
-        assert!(body(&frame).contains("1/3"));
-        assert!(body(&frame).contains("enter edit"));
-        assert!(body(&frame).contains("esc cancel"));
     }
 
     #[test]
@@ -1031,18 +1401,104 @@ mod tests {
     }
 
     #[test]
-    fn visible_width_ignores_escape_sequences() {
-        assert_eq!(visible_width("plain"), 5);
-        assert_eq!(visible_width("\x1b[32m➜\x1b[0m ~ $"), 5);
-        assert_eq!(visible_width("\x1b[1;36mheader\x1b[0m"), 6);
-        assert_eq!(visible_width(""), 0);
-    }
-
-    #[test]
     fn split_match_finds_ascii_case_insensitively() {
         assert_eq!(split_match("Git Status", "git"), ("", "Git", " Status"));
         assert_eq!(split_match("run Git now", "GIT"), ("run ", "Git", " now"));
         assert_eq!(split_match("nothing", "zzz"), ("nothing", "", ""));
         assert_eq!(split_match("anything", ""), ("anything", "", ""));
+    }
+
+    #[test]
+    fn cursor_replies_are_separated_from_typed_input() {
+        assert_eq!(cursor_reply(b"\x1b[24;1R"), Some((0, (24, 1))));
+        assert_eq!(cursor_reply(b"bet\x1b[7;12R"), Some((3, (7, 12))));
+        assert_eq!(cursor_reply(b"\x1b[24;1"), None);
+        assert_eq!(cursor_reply(b"typed"), None);
+        assert_eq!(cursor_reply(b"\x1b[?24;1R"), None);
+    }
+
+    #[test]
+    fn prompt_height_accounts_for_wrapping_and_hints() {
+        assert_eq!(prompt_height("\x1b[32m\u{27a4}\x1b[0m ", "", 0, 10), 1);
+        assert_eq!(prompt_height("12345678", "ab", 0, 10), 1);
+        assert_eq!(prompt_height("12345678", "ab", 1, 10), 2);
+        assert_eq!(prompt_height("123456789", "ab", 0, 10), 2);
+        assert_eq!(prompt_height("12345", "6789012345", 0, 10), 2);
+        assert_eq!(prompt_height("> ", "a\nb", 0, 10), 2);
+    }
+
+    #[test]
+    fn prompt_row_is_one_row_above_the_cursor() {
+        assert_eq!(prompt_row_from_cursor(24, 24), 22);
+        assert_eq!(prompt_row_from_cursor(5, 24), 3);
+        assert_eq!(prompt_row_from_cursor(1, 24), 0);
+        assert_eq!(prompt_row_from_cursor(2, 24), 0);
+    }
+
+    #[test]
+    fn layout_opens_downwards_when_there_is_room_below() {
+        let layout = layout(24, 5, 5);
+        assert!(!layout.upward);
+        assert!(!layout.prompt_visible);
+        assert_eq!(layout.scrolled, 0);
+        assert_eq!(layout.popup_start, 5);
+        assert_eq!(layout.popup_end, 10);
+        assert_eq!(layout.query_row, 5);
+        assert_eq!(layout.match_start, 6);
+    }
+
+    #[test]
+    fn layout_keeps_the_prompt_visible_at_the_bottom() {
+        let layout = layout(24, 23, 5);
+        assert!(layout.upward);
+        assert!(layout.prompt_visible);
+        assert_eq!(layout.scrolled, 6);
+        assert_eq!(layout.popup_start, 17);
+        assert_eq!(layout.popup_end, 22);
+        assert_eq!(layout.query_row, 22);
+        assert_eq!(layout.match_start, 17);
+    }
+
+    #[test]
+    fn layout_keeps_the_prompt_visible_near_the_bottom() {
+        let layout = layout(24, 20, 5);
+        assert!(layout.upward);
+        assert!(layout.prompt_visible);
+        assert_eq!(layout.scrolled, 6);
+        assert_eq!(layout.popup_start, 14);
+        assert_eq!(layout.popup_end, 19);
+        assert_eq!(layout.query_row, 19);
+        assert_eq!(layout.match_start, 14);
+    }
+
+    #[test]
+    fn layout_uses_the_fallback_when_there_is_no_room_above_the_prompt() {
+        let layout = layout(4, 2, 2);
+        assert!(layout.upward);
+        assert!(!layout.prompt_visible);
+        assert_eq!(layout.scrolled, 1);
+        assert_eq!(layout.popup_start, 1);
+        assert_eq!(layout.popup_end, 3);
+        assert_eq!(layout.query_row, 3);
+        assert_eq!(layout.match_start, 1);
+    }
+
+    #[test]
+    fn layout_handles_tiny_terminals() {
+        let bottom = layout(3, 2, 1);
+        assert!(bottom.upward);
+        assert!(bottom.prompt_visible);
+        assert_eq!(bottom.scrolled, 2);
+        assert_eq!(bottom.popup_start, 0);
+        assert_eq!(bottom.popup_end, 1);
+        assert_eq!(bottom.query_row, 1);
+        assert_eq!(bottom.match_start, 0);
+
+        let top = layout(3, 1, 1);
+        assert!(!top.upward);
+        assert!(!top.prompt_visible);
+        assert_eq!(top.scrolled, 0);
+        assert_eq!(top.popup_start, 1);
+        assert_eq!(top.query_row, 1);
     }
 }

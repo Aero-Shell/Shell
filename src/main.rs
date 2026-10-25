@@ -566,13 +566,12 @@ fn read_prompt_line(
                     return Ok(PromptLine::Interrupted);
                 };
                 let entries = history_entries(rl);
-                let picked = history_search::pick(entries, &line);
-                history_search::erase_prompt_line(prompt, &line, hint_len);
+                let picked = history_search::pick(entries, &line, prompt, hint_len);
                 resume = Some(match picked {
                     history_search::Picked::Entry(entry) => (entry, String::new()),
                     history_search::Picked::Cancelled => split_at_cursor(line, pos),
                     history_search::Picked::Unavailable => {
-                        registry::print_colored("ash: no history to search yet", "warning");
+                        registry::print_colored("ash: history search unavailable", "warning");
                         split_at_cursor(line, pos)
                     }
                 });
