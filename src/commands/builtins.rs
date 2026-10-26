@@ -180,9 +180,37 @@ pub fn pwd(_args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-pub fn exit(_args: &[&str]) -> Result<()> {
+pub fn exit(args: &[&str]) -> Result<()> {
+    // Reached only from a pipeline (`true | exit`); a plain `exit` step is
+    // reported by the REPL/`-c` layer so the shell can unwind cleanly.
+    let status = exit_status(args, 0);
     registry::print_colored("Exiting Ash...", "warning");
-    std::process::exit(0);
+    std::process::exit(status);
+}
+
+// The status `exit`/`quit` ends the shell with, given the arguments after the
+// command name and the status of the last command that ran. POSIX: no
+// argument keeps that last status, `exit n` exits with n — only the low eight
+// bits reach the caller, so `exit 300` is `exit 44`. A non-numeric argument is
+// a usage error, reported with status 2.
+//
+// The code has to reach the process exit status: Cockpit checks whether a
+// login shell works by running `<shell> -c "exit 71;"` and accepting only 71,
+// otherwise it refuses the login as an "unsupported shell".
+pub fn exit_status(args: &[&str], last_status: i32) -> i32 {
+    let Some(arg) = args.first() else {
+        return last_status;
+    };
+    match arg.parse::<i32>() {
+        Ok(code) => code.rem_euclid(256),
+        Err(_) => {
+            registry::print_colored(
+                &format!("ash: exit: {arg}: numeric argument required"),
+                "error",
+            );
+            2
+        }
+    }
 }
 
 pub fn clear(_args: &[&str]) -> Result<()> {

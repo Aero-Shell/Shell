@@ -427,11 +427,12 @@ fn main() -> Result<()> {
     }
 
     if let Some(cmd) = shell_args.command {
-        // `-c` exits with the command's status, like other shells. exit()
-        // skips destructors, so flush first in case output is still buffered.
-        let status = run_command_line(&cmd)?.unwrap_or(0);
+        // `-c` exits with the command's status, like other shells — including
+        // a status given to `exit`, which Cockpit's login probe depends on.
+        // exit() skips destructors, so flush first in case output is buffered.
+        let outcome = run_command_line(&cmd)?;
         std::io::stdout().flush().ok();
-        std::process::exit(status);
+        std::process::exit(outcome.status);
     }
 
     registry::print_colored("Type help for commands.", "success");
@@ -549,8 +550,11 @@ fn main() -> Result<()> {
             continue;
         }
 
-        if run_command_line(trimmed)?.is_none() {
-            break; // exit/quit
+        let outcome = run_command_line(trimmed)?;
+        if outcome.exiting {
+            // exit/quit: hand back the requested status, like other shells.
+            std::io::stdout().flush().ok();
+            std::process::exit(outcome.status);
         }
     }
 
@@ -620,12 +624,36 @@ fn split_at_cursor(text: String, pos: usize) -> (String, String) {
     (left, right)
 }
 
+// What running one command line did: the status it finished with, and whether
+// it ended the session with `exit`/`quit`. `-c` exits with the status either
+// way; the REPL only needs to know when to stop reading lines.
+struct RunOutcome {
+    status: i32,
+    exiting: bool,
+}
+
+impl RunOutcome {
+    fn finished(status: i32) -> Self {
+        RunOutcome {
+            status,
+            exiting: false,
+        }
+    }
+
+    fn exiting(status: i32) -> Self {
+        RunOutcome {
+            status,
+            exiting: true,
+        }
+    }
+}
+
 // Run one command line: pipelines joined by `&&`, `||` and `;`, with each
 // stage's redirections applied. Heredoc bodies are read from the lines that
 // follow the command, and anything after the last delimiter runs in turn.
-// Returns Ok(None) when the line was exit/quit, otherwise the status of the
-// last command that ran.
-fn run_command_line(line: &str) -> Result<Option<i32>> {
+// Returns Ok with `exiting` set when the line was exit/quit, otherwise the
+// status of the last command that ran.
+fn run_command_line(line: &str) -> Result<RunOutcome> {
     let mut text = line.to_string();
     loop {
         let (command_line, bodies, leftover) = match split_heredocs(&text) {
@@ -635,31 +663,31 @@ fn run_command_line(line: &str) -> Result<Option<i32>> {
                     &format!("ash: syntax error: unterminated heredoc '{delimiter}'"),
                     "error",
                 );
-                return Ok(Some(2));
+                return Ok(RunOutcome::finished(2));
             }
             Err(HereDocError::Syntax(message)) => {
                 registry::print_colored(&message, "error");
-                return Ok(Some(2));
+                return Ok(RunOutcome::finished(2));
             }
         };
-        let status = match run_single_command_line(&command_line, bodies)? {
-            Some(code) => code,
-            None => return Ok(None), // exit/quit
-        };
+        let outcome = run_single_command_line(&command_line, bodies)?;
+        if outcome.exiting {
+            return Ok(outcome); // exit/quit
+        }
         match leftover {
             Some(rest) if !rest.trim().is_empty() => text = rest,
-            _ => return Ok(Some(status)),
+            _ => return Ok(outcome),
         }
     }
 }
 
-fn run_single_command_line(line: &str, bodies: Vec<String>) -> Result<Option<i32>> {
+fn run_single_command_line(line: &str, bodies: Vec<String>) -> Result<RunOutcome> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         // Blank lines are no-ops. `scan` ends a `#` comment at its own
         // newline, so a multi-line block that starts with a comment still
         // runs the commands after it.
-        return Ok(Some(0));
+        return Ok(RunOutcome::finished(0));
     }
 
     // Expand aliases on the raw line so that operators (`&&`, `||`, `|`,
@@ -675,11 +703,11 @@ fn run_single_command_line(line: &str, bodies: Vec<String>) -> Result<Option<i32
         Ok(steps) => steps,
         Err(message) => {
             registry::print_colored(&message, "error");
-            return Ok(Some(2));
+            return Ok(RunOutcome::finished(2));
         }
     };
     if steps.is_empty() {
-        return Ok(Some(0));
+        return Ok(RunOutcome::finished(0));
     }
 
     // Run the steps left to right: `&&` needs the previous status to be 0,
@@ -691,20 +719,23 @@ fn run_single_command_line(line: &str, bodies: Vec<String>) -> Result<Option<i32
             continue;
         }
         // exit/quit ends the session. Report it here instead of letting the
-        // builtin call exit() so the REPL breaks and `-c` exits cleanly.
+        // builtin call exit() so the REPL breaks and `-c` exits cleanly —
+        // carrying the requested status out to the process exit code.
         if let [stage] = step.stages.as_slice()
             && stage
                 .words
                 .first()
                 .is_some_and(|w| w == "exit" || w == "quit")
         {
+            let args: Vec<&str> = stage.words[1..].iter().map(String::as_str).collect();
+            let status = builtins::exit_status(&args, status);
             registry::print_colored("Exiting Ash...", "warning");
-            return Ok(None);
+            return Ok(RunOutcome::exiting(status));
         }
         status = run_pipeline(&step.stages)?;
     }
 
-    Ok(Some(status))
+    Ok(RunOutcome::finished(status))
 }
 
 // Whether the step after `previous` runs, given the status before it.
@@ -2305,6 +2336,44 @@ mod tests {
         assert!(!step_runs_after(&with_join(Some(Join::Or)), 0));
         assert!(step_runs_after(&with_join(Some(Join::Semi)), 1));
         assert!(step_runs_after(&with_join(None), 1));
+    }
+
+    // Cockpit decides whether a login shell is usable by running
+    // `<shell> -c "exit 71;"` and accepting nothing but status 71 (issue #30).
+    #[test]
+    fn exit_carries_its_status_out_of_the_shell() {
+        let probe = run_command_line("exit 71;").unwrap();
+        assert!(probe.exiting);
+        assert_eq!(probe.status, 71);
+
+        let no_arg = run_command_line("exit;").unwrap();
+        assert!(no_arg.exiting);
+        assert_eq!(no_arg.status, 0);
+
+        let bad = run_command_line("exit nope;").unwrap();
+        assert!(bad.exiting);
+        assert_eq!(bad.status, 2);
+
+        // Only the low eight bits reach the caller, like other shells.
+        let wrapped = run_command_line("exit 300;").unwrap();
+        assert!(wrapped.exiting);
+        assert_eq!(wrapped.status, 44);
+    }
+
+    #[test]
+    fn a_line_without_exit_keeps_the_shell_running() {
+        let blank = run_command_line("").unwrap();
+        assert!(!blank.exiting);
+        assert_eq!(blank.status, 0);
+    }
+
+    #[test]
+    fn exit_status_follows_posix_argument_rules() {
+        // No argument keeps the status of the last command that ran.
+        assert_eq!(builtins::exit_status(&[], 7), 7);
+        assert_eq!(builtins::exit_status(&["71"], 7), 71);
+        assert_eq!(builtins::exit_status(&["-1"], 0), 255);
+        assert_eq!(builtins::exit_status(&["nope"], 0), 2);
     }
 
     fn hint_for(line: &str, pos: usize, entries: &[&str]) -> Option<String> {
