@@ -151,6 +151,13 @@ cargo run
 
 Code layout:
 
+- `src/main.rs` — REPL, argument parsing, prompt, login-shell handling
+- `src/shell/` — the shell itself: `lexer.rs` and `parser.rs` (tokens, AST),
+  `expand.rs` (parameters, command substitution, arithmetic, splitting, globs),
+  `exec.rs` (control flow, pipelines, redirections, `exec`), `special.rs`
+  (POSIX special builtins), `mod.rs` (shell state)
+- `tests/cli.rs` — end-to-end tests that run the real binary: `-c`, script
+  files and `-l`
 - `src/history_search.rs` — searchable history picker (Ctrl-R / Up)
 - `src/commands/builtins.rs` — built-in commands
 - `src/commands/aepkg.rs` — package manager command
