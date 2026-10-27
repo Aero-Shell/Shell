@@ -475,12 +475,14 @@ impl Parser {
         match kind {
             RedirOp::HereDoc {
                 strip_tabs,
+                quoted,
                 delimiter,
                 body,
             } => Ok(Redir {
                 target: Word::default(),
                 kind: RedirOp::HereDoc {
                     strip_tabs,
+                    quoted,
                     delimiter,
                     body,
                 },

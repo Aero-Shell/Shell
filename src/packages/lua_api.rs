@@ -108,6 +108,13 @@ pub fn clear_last_exit_status() {
     LAST_EXIT_STATUS.with(|slot| slot.set(None));
 }
 
+/// Record the status a builtin wants the shell to report. A builtin returns
+/// `Ok(())` even when it failed, so this is how it says so (e.g. `alias` for
+/// a name it could not find).
+pub fn set_last_exit_status(code: i32) {
+    LAST_EXIT_STATUS.with(|slot| slot.set(Some(code)));
+}
+
 pub fn take_last_exit_status() -> Option<i32> {
     LAST_EXIT_STATUS.with(Cell::take)
 }
@@ -179,7 +186,7 @@ fn command_args_table(lua: &Lua, cmd: &str, args: &[&str]) -> Result<LuaTable> {
 /// success.
 pub fn run_command(root: &Path, command: &str, args: &[&str]) -> Result<()> {
     let code = run_command_code(root, command, args)?;
-    LAST_EXIT_STATUS.with(|slot| slot.set(Some(code)));
+    set_last_exit_status(code);
     if code != 0 {
         crate::registry::print_colored(
             &format!("ash: package command '{command}' exited with {code}"),

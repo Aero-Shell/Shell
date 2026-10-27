@@ -14,7 +14,7 @@ use crate::packages;
 use crate::registry;
 
 use super::expand::{ExpandError, ExpandMode, pattern_match};
-use super::lexer::RedirOp;
+use super::lexer::{RedirOp, lex_heredoc_body};
 use super::parser::{AndOr, CaseArm, Command, Compound, CompoundKind, Join, Pipeline, Program, Redir, Simple};
 use super::{Flow, Shell, is_special_builtin};
 
@@ -125,6 +125,38 @@ fn restore_fds(saved: &mut [Option<std::fs::File>; 3]) {
         if let Some(copy) = previous.take() {
             unsafe { libc::dup2(copy.as_raw_fd(), fd as i32) };
         }
+    }
+}
+
+/// The operands of `exec`: its own options end at `--`.
+pub(crate) fn exec_operands(args: &[String]) -> &[String] {
+    match args.first() {
+        Some(first) if first == "--" => &args[1..],
+        _ => args,
+    }
+}
+
+/// Resolve a command operand to a path. `Err` is the status a shell reports
+/// for the failure: 126 for something that exists but cannot be executed, 127
+/// for a name that resolves to nothing.
+fn resolve_operand(name: &str) -> Result<String, i32> {
+    if std::path::Path::new(name).is_dir() {
+        return Err(126);
+    }
+    builtins::which_cmd(name).ok_or(127)
+}
+
+/// Why an operand could not be run, in a shell's words rather than Rust's.
+fn operand_reason(status: i32) -> &'static str {
+    if status == 126 { "Is a directory" } else { "not found" }
+}
+
+/// `Is a directory (os error 21)`: a shell reports the reason, not the number.
+pub(crate) fn clean_io_error(error: &std::io::Error) -> String {
+    let text = error.to_string();
+    match text.split_once(" (os error ") {
+        Some((reason, _)) => reason.to_string(),
+        None => text,
     }
 }
 
@@ -781,12 +813,17 @@ impl Shell {
                 argv
             },
         };
-        match builtins::which_cmd(name) {
-            Some(path) => self.run_external(&path, &prepared),
-            None => {
-                registry::print_colored(&format!("ash: command not found: {name}"), "error");
-                self.last_status = 127;
-                Flow::Status(127)
+        match resolve_operand(name) {
+            Ok(path) => self.run_external(&path, &prepared),
+            Err(status) => {
+                let message = if status == 126 {
+                    format!("ash: {name}: {}", operand_reason(status))
+                } else {
+                    format!("ash: command not found: {name}")
+                };
+                registry::print_colored(&message, "error");
+                self.last_status = status;
+                Flow::Status(status)
             }
         }
     }
@@ -986,7 +1023,7 @@ impl Shell {
     /// `exec`: replace this process with `command`, or apply redirections to
     /// the shell itself when no command is given.
     fn exec_replace(&mut self, prepared: &Prepared, slots: &[FdSlot; 3]) -> Flow {
-        let args = &prepared.argv[1..];
+        let args = exec_operands(&prepared.argv[1..]);
         if args.is_empty() {
             if let Err(status) = apply_redirs_permanently(slots) {
                 self.last_status = status;
@@ -995,10 +1032,16 @@ impl Shell {
             return Flow::Status(0);
         }
         let name = &args[0];
-        let Some(path) = builtins::which_cmd(name) else {
-            registry::print_colored(&format!("ash: exec: {name}: not found"), "error");
-            self.last_status = 127;
-            return self.exec_failed(127);
+        let path = match resolve_operand(name) {
+            Ok(path) => path,
+            Err(status) => {
+                registry::print_colored(
+                    &format!("ash: exec: {name}: {}", operand_reason(status)),
+                    "error",
+                );
+                self.last_status = status;
+                return self.exec_failed(status);
+            }
         };
         if let Err(status) = apply_redirs_permanently(slots) {
             self.last_status = status;
@@ -1019,7 +1062,10 @@ impl Shell {
             });
         }
         let error = command.exec();
-        registry::print_colored(&format!("ash: exec: {name}: {error}"), "error");
+        registry::print_colored(
+            &format!("ash: exec: {name}: {}", clean_io_error(&error)),
+            "error",
+        );
         self.last_status = 126;
         self.exec_failed(126)
     }
@@ -1282,8 +1328,17 @@ impl Shell {
                     slots[1] = FdSlot::File(open_target(&target, true, false)?);
                     slots[2] = dup_slot(&slots[1])?;
                 }
-                RedirOp::HereDoc { body, .. } => {
-                    slots[0] = FdSlot::File(heredoc_input(body)?);
+                RedirOp::HereDoc {
+                    body,
+                    quoted,
+                    ..
+                } => {
+                    let text = if *quoted {
+                        body.clone()
+                    } else {
+                        self.expand_heredoc_body(body)?
+                    };
+                    slots[0] = FdSlot::File(heredoc_input(&text)?);
                 }
                 RedirOp::Dup { fd, from } => {
                     if (0..3).contains(fd) && (0..3).contains(from) {
@@ -1298,6 +1353,13 @@ impl Shell {
     fn redir_target(&mut self, redir: &Redir) -> Result<String, String> {
         self.expand_to_string(&redir.target)
             .map_err(|error| error.message)
+    }
+
+    /// A heredoc body is expanded like a double-quoted string; `<<'EOF'` keeps
+    /// it literal.
+    fn expand_heredoc_body(&mut self, body: &str) -> Result<String, String> {
+        let word = lex_heredoc_body(body);
+        self.expand_to_string(&word).map_err(|error| error.message)
     }
 }
 
@@ -1420,9 +1482,42 @@ mod tests {
         let line = format!("echo hello > {}", out.to_string_lossy());
         assert_eq!(first.run_text(&line).status(), 0);
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "hello\n");
-        // Heredoc into an external command.
+
+        // Heredoc into an external command: an unquoted delimiter expands the
+        // body like a double-quoted string (bash's result, byte for byte).
         let mut second = new_shell();
-        assert_eq!(second.run_text("cat <<EOF\nx\nEOF\n").status(), 0);
+        second.set_var("ASH_WORD", "expanded", false).unwrap();
+        let line = format!(
+            "cat <<EOF > {}\n$ASH_WORD ${{ASH_WORD}} $(/bin/echo sub)\nEOF\n",
+            out.to_string_lossy()
+        );
+        assert_eq!(second.run_text(&line).status(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "expanded expanded sub\n"
+        );
+
+        // A quoted delimiter leaves the body alone.
+        let mut third = new_shell();
+        let line = format!(
+            "cat <<'EOF' > {}\n$ASH_WORD $(/bin/echo sub)\nEOF\n",
+            out.to_string_lossy()
+        );
+        assert_eq!(third.run_text(&line).status(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "$ASH_WORD $(/bin/echo sub)\n"
+        );
+
+        // A backslash in an unquoted body escapes `$`, `\\` and a newline —
+        // and nothing else.
+        let mut fourth = new_shell();
+        let line = format!(
+            "cat <<EOF > {}\na\\$ASH_WORD b\\\\c \\\nd\nEOF\n",
+            out.to_string_lossy()
+        );
+        assert_eq!(fourth.run_text(&line).status(), 0);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "a$ASH_WORD b\\c d\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 

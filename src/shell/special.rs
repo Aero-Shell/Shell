@@ -635,6 +635,7 @@ impl Shell {
     /// the surrounding construct stops there, exactly as if that context had
     /// been replaced; only the parent shell keeps going.
     fn builtin_exec_child(&mut self, args: &[String]) -> Flow {
+        let args = super::exec::exec_operands(args);
         if args.is_empty() {
             return Flow::Status(0);
         }

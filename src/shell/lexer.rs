@@ -156,9 +156,12 @@ pub enum RedirOp {
     Dup { fd: i32, from: i32 },
     /// `<<` / `<<-`. The delimiter word is consumed by the lexer and the body
     /// is filled in once the following lines have been read, so both travel
-    /// with the token (alias expansion splices tokens around).
+    /// with the token (alias expansion splices tokens around). `quoted` records
+    /// whether any part of the delimiter was quoted, which is what decides if
+    /// the body gets expanded when the redirection is opened.
     HereDoc {
         strip_tabs: bool,
+        quoted: bool,
         delimiter: String,
         body: String,
     },
@@ -253,6 +256,30 @@ pub fn lex_fragment(text: &str) -> Word {
             }],
         },
     }
+}
+
+/// Lex a heredoc body — everything that sits between `<<WORD` and the
+/// delimiter line — as one word. The caller expands it exactly when the
+/// delimiter was unquoted.
+pub fn lex_heredoc_body(text: &str) -> Word {
+    let chars: Vec<char> = text.chars().collect();
+    let mut lexer = Lexer {
+        chars: &chars,
+        pos: 0,
+        tokens: Vec::new(),
+        pending: Vec::new(),
+    };
+    let mut word = Word::default();
+    // An unterminated `${` or `$(` in the body falls back to literal text.
+    if lexer.scan_heredoc_body(&mut word).is_err() {
+        return Word {
+            segs: vec![Seg::Lit {
+                text: text.to_string(),
+                quoted: true,
+            }],
+        };
+    }
+    word
 }
 
 impl Lexer<'_> {
@@ -413,6 +440,7 @@ impl Lexer<'_> {
         let token_index = self.tokens.len();
         self.tokens.push(Token::Op(Op::Redir(RedirOp::HereDoc {
             strip_tabs,
+            quoted: false,
             delimiter: String::new(),
             body: String::new(),
         })));
@@ -429,6 +457,16 @@ impl Lexer<'_> {
                     "ash: syntax error near unexpected token '<<'".to_string(),
                 ))
             };
+        }
+        // Quoting any part of the delimiter turns off expansion of the body.
+        let quoted = word.segs.iter().any(|seg| match seg {
+            Seg::Lit { quoted, .. } => *quoted,
+            _ => true,
+        });
+        if let Token::Op(Op::Redir(RedirOp::HereDoc { quoted: slot, .. })) =
+            &mut self.tokens[token_index]
+        {
+            *slot = quoted;
         }
         let delimiter = word
             .literal_text()
@@ -622,6 +660,39 @@ impl Lexer<'_> {
                 Ok(())
             }
         }
+    }
+
+    /// Lex an unquoted heredoc body: like a double-quoted string, but with no
+    /// terminator and `"` as an ordinary character.
+    fn scan_heredoc_body(&mut self, word: &mut Word) -> LexResult<()> {
+        while self.pos < self.chars.len() {
+            let ch = self.chars[self.pos];
+            match ch {
+                '\\' => {
+                    self.pos += 1;
+                    match self.peek() {
+                        None => self.append_lit(word, "\\", true),
+                        Some('\n') => self.pos += 1,
+                        Some('$' | '`' | '\\') => {
+                            let c = self.chars[self.pos];
+                            self.pos += 1;
+                            self.append_lit(word, &c.to_string(), true);
+                        }
+                        Some(c) => {
+                            self.pos += 1;
+                            self.append_lit(word, &format!("\\{c}"), true);
+                        }
+                    }
+                }
+                '$' => self.scan_dollar(word, true)?,
+                '`' => self.scan_backtick(word, true)?,
+                c => {
+                    self.pos += 1;
+                    self.append_lit(word, &c.to_string(), true);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn scan_double_quoted(&mut self, word: &mut Word) -> LexResult<()> {
@@ -1170,6 +1241,29 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn heredoc_quoting(text: &str) -> Vec<bool> {
+        lex(text)
+            .unwrap()
+            .tokens
+            .into_iter()
+            .filter_map(|token| match token {
+                Token::Op(Op::Redir(RedirOp::HereDoc { quoted, .. })) => Some(quoted),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn heredoc_delimiters_record_whether_they_were_quoted() {
+        // Only a fully unquoted delimiter turns on expansion of the body.
+        assert_eq!(heredoc_quoting("cat <<EOF\nx\nEOF\n"), [false]);
+        assert_eq!(heredoc_quoting("cat <<-EOF\nx\nEOF\n"), [false]);
+        assert_eq!(heredoc_quoting("cat <<'EOF'\nx\nEOF\n"), [true]);
+        assert_eq!(heredoc_quoting("cat <<\"EOF\"\nx\nEOF\n"), [true]);
+        assert_eq!(heredoc_quoting("cat <<\\EOF\nx\nEOF\n"), [true]);
+        assert_eq!(heredoc_quoting("cat <<E\"OF\"\nx\nEOF\n"), [true]);
     }
 
     #[test]

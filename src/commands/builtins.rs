@@ -371,11 +371,16 @@ pub fn alias(args: &[&str]) -> Result<()> {
     // Everything after the subcommands below is Ash's own spelling.
     if !args.is_empty() && !matches!(args[0], "create" | "ls" | "rm") {
         let mut definitions: Vec<(String, String)> = Vec::new();
+        let mut failed = false;
         for arg in args {
             match arg.split_once('=') {
                 Some((name, value)) => {
-                    if !is_valid_name(name) {
-                        registry::print_colored(&format!("alias: invalid name: {name}"), "error");
+                    if !is_valid_alias_name(name) {
+                        registry::print_colored(
+                            &format!("alias: {name}: invalid alias name"),
+                            "error",
+                        );
+                        failed = true;
                         continue;
                     }
                     definitions.push((name.to_string(), value.to_string()));
@@ -384,6 +389,7 @@ pub fn alias(args: &[&str]) -> Result<()> {
                     Some(command) => println!("{arg} -> {command}"),
                     None => {
                         registry::print_colored(&format!("alias: {arg}: not found"), "error");
+                        failed = true;
                     }
                 },
             }
@@ -394,6 +400,9 @@ pub fn alias(args: &[&str]) -> Result<()> {
                     cfg.aliases.insert(name, value);
                 }
             })?;
+        }
+        if failed {
+            crate::packages::lua_api::set_last_exit_status(1);
         }
         return Ok(());
     }
@@ -406,8 +415,11 @@ pub fn alias(args: &[&str]) -> Result<()> {
             }
         }
         ["create", name, command] => {
-            if !is_valid_name(name) {
-                registry::print_colored(&format!("alias: invalid name: {name}"), "error");
+            if !is_valid_alias_name(name) {
+                registry::print_colored(
+                    &format!("alias: {name}: invalid alias name"),
+                    "error",
+                );
                 return Ok(());
             }
             // Store the command exactly as the user typed it (the incoming
@@ -615,13 +627,20 @@ pub fn expand_tilde(word: &str) -> PathBuf {
     PathBuf::from(word)
 }
 
-fn is_valid_name(name: &str) -> bool {
+/// Alias names are not variable names: bash and dash take `mingw64-env` or
+/// `1devel` from a profile without complaint, and reject only names carrying
+/// whitespace, a slash or a shell metacharacter.
+fn is_valid_alias_name(name: &str) -> bool {
     !name.is_empty()
-        && name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !name.starts_with('-')
+        && !name.chars().any(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '/' | '=' | '\\' | '\'' | '"' | '`' | '$' | '|' | '&' | ';' | '<' | '>'
+                        | '(' | ')' | '[' | ']' | '{' | '}' | '*' | '?' | '~' | '!'
+                )
+        })
 }
 
 // Apply a config change and persist it.
@@ -674,12 +693,16 @@ mod tests {
     }
 
     #[test]
-    fn valid_names_start_with_a_letter_or_underscore() {
-        for name in ["a", "_x", "foo_bar", "A1", "alias2"] {
-            assert!(is_valid_name(name), "{name} should be valid");
+    fn alias_names_may_hold_hyphens_but_no_metacharacters() {
+        // Profile scripts in the wild define aliases like `mingw64-env`;
+        // bash and dash both accept those.
+        for name in ["a", "_x", "foo_bar", "A1", "mingw64-env", "1devel", "g++"] {
+            assert!(is_valid_alias_name(name), "{name} should be valid");
         }
-        for name in ["", "1a", "a-b", "a b", "a.b", "ünïcode"] {
-            assert!(!is_valid_name(name), "{name} should be invalid");
+        for name in [
+            "", "a b", "a/b", "a=b", "a;b", "a|b", "a>b", "-x", "a'b", "a$b",
+        ] {
+            assert!(!is_valid_alias_name(name), "{name} should be invalid");
         }
     }
 

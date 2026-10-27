@@ -56,17 +56,27 @@ Built-in commands (also listed by `help`):
 | `help` | Command list |
 | `exit` / `quit` | Exit |
 
-CLI flags: `ash --help`, `ash --version`, `ash --set-default`, `ash -c '<cmd>'`.
+CLI: `ash -c '<cmd>'`, `ash <file> [args…]` (a non-option argument is read
+as a script), `ash -l` (login: source `/etc/profile` and `~/.profile` first),
+`ash --help`, `ash --version`, `ash --set-default`.
 
-One-liners work like a POSIX shell: pipelines (`|`), sequencing (`&&`, `||`,
-`;`) and redirection (`<`, `>`, `>>`, `2>`, `2>>`, `2>&1`, `&>`) all apply per
-command, and builtins or package commands can be pipeline stages:
+One-liners work like a POSIX shell: parameter and command substitution
+(`$VAR`, `${VAR}`, `$(cmd)`, `` `cmd` ``), pipelines (`|`), sequencing (`&&`,
+`||`, `;`) and redirection (`<`, `>`, `>>`, `<<`, `2>`, `2>>`, `2>&1`, `&>`)
+all apply per command, and builtins or package commands can be pipeline
+stages. Heredoc bodies are expanded unless the delimiter is quoted:
 
 ```bash
 cargo build && ./target/release/aeroshell --help
 ls -la > /tmp/out.txt && cat < /tmp/out.txt
 false && echo skipped || echo ran
 history 20 | tail
+cat <<EOF
+heredocs expand $HOME and $(uname -s)
+EOF
+cat <<'EOF'
+but this one stays literal: $HOME
+EOF
 ```
 
 ### History search

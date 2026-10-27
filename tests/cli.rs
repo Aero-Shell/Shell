@@ -50,6 +50,25 @@ fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
+/// A script the shell can `exec`: [`write_script`] plus the execute bit.
+fn write_executable(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let path = write_script(dir, name, body);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod +x");
+    }
+    path
+}
+
+/// The login user's name, read the way the shell reads `$USER`.
+fn whoami() -> String {
+    std::env::var("USER").unwrap_or_else(|_| {
+        let out = Command::new("id").arg("-un").output().expect("id -un");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    })
+}
+
 #[test]
 fn exec_replaces_the_shell_with_the_command() {
     // The exact shape gnome-session uses to re-exec itself through a login
@@ -93,6 +112,135 @@ fn exec_with_only_redirections_applies_them_to_the_shell() {
     assert_eq!(outcome.status, 0, "stderr: {}", outcome.stderr);
     assert!(outcome.stdout.is_empty(), "stdout: {}", outcome.stdout);
     assert_eq!(fs::read_to_string(&target).unwrap(), "redirected\n");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn exec_option_terminator_and_operand_statuses() {
+    // `--` ends `exec`'s own options, and the operand keeps its spaces: the
+    // argument list must arrive un-split, command and flags alike.
+    let dir = temp_dir("exec-dashdash");
+    let spaced = dir.join("dir with space");
+    fs::create_dir_all(&spaced).expect("create spaced dir");
+    let stub = write_executable(
+        &spaced,
+        "show-args",
+        "#!/bin/sh\nprintf 'argv0=%s args=%s\\n' \"$0\" \"$*\"\nexit 7\n",
+    );
+    let path = stub.to_string_lossy().into_owned();
+    let outcome = shell(&format!("exec -- '{path}' --no-reexec"));
+    assert_eq!(outcome.status, 7, "stderr: {}", outcome.stderr);
+    assert_eq!(outcome.stdout, format!("argv0={path} args=--no-reexec\n"));
+
+    // `exec --` on its own is a no-op that leaves the shell running.
+    let outcome = shell("exec --; echo after");
+    assert_eq!(outcome.stdout, "after\n");
+    assert_eq!(outcome.status, 0);
+
+    // A directory is "cannot execute" (126), reported without Rust's
+    // `(os error 21)` — for an `exec` operand and for a script operand alike.
+    let outcome = shell("exec /tmp; echo after");
+    assert_eq!(outcome.status, 126, "stderr: {}", outcome.stderr);
+    assert!(!outcome.stdout.contains("after"), "{}", outcome.stdout);
+    assert!(
+        outcome.stderr.contains("/tmp: Is a directory"),
+        "{}",
+        outcome.stderr
+    );
+    assert!(!outcome.stderr.contains("os error"), "{}", outcome.stderr);
+
+    let outcome = run(&["/tmp"]);
+    assert_eq!(outcome.status, 126, "stderr: {}", outcome.stderr);
+    assert!(
+        outcome.stderr.contains("/tmp: Is a directory"),
+        "{}",
+        outcome.stderr
+    );
+    assert!(!outcome.stderr.contains("os error"), "{}", outcome.stderr);
+
+    // Something that exists but cannot be executed is 126 too, with the same
+    // clean reason.
+    let outcome = shell("exec /etc/hostname; echo after");
+    assert_eq!(outcome.status, 126, "stderr: {}", outcome.stderr);
+    assert!(
+        outcome.stderr.contains("Permission denied"),
+        "{}",
+        outcome.stderr
+    );
+    assert!(!outcome.stderr.contains("os error"), "{}", outcome.stderr);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn heredoc_bodies_expand_unless_the_delimiter_is_quoted() {
+    // Bash's output for each of these, byte for byte.
+    let outcome = shell("X=1\ncat <<EOF\n$X ${X} $(echo sub) `echo bt`\nEOF\n");
+    assert_eq!(outcome.stdout, "1 1 sub bt\n", "stderr: {}", outcome.stderr);
+    assert_eq!(outcome.status, 0);
+
+    let outcome = shell("X=1\ncat <<'EOF'\n$X $(echo sub)\nEOF\n");
+    assert_eq!(
+        outcome.stdout, "$X $(echo sub)\n",
+        "stderr: {}",
+        outcome.stderr
+    );
+
+    // A loop variable is re-expanded for every iteration.
+    let outcome = shell("for i in 1 2; do cat <<EOF\nline $i\nEOF\ndone\n");
+    assert_eq!(
+        outcome.stdout, "line 1\nline 2\n",
+        "stderr: {}",
+        outcome.stderr
+    );
+
+    // `\$`, `\\` and backslash-newline are the only escapes an unquoted body
+    // honours; `\"` keeps its backslash.
+    let outcome = shell("cat <<EOF\na\\$X b\\\\c \\\nd \\\"q\\\"\nEOF\n");
+    assert_eq!(
+        outcome.stdout, "a$X b\\c d \\\"q\\\"\n",
+        "stderr: {}",
+        outcome.stderr
+    );
+
+    // A body reaches a builtin loop the same way it reaches an external.
+    let outcome = shell("while read l; do echo \"got $l\"; done <<EOF\n$USER\nEOF\n");
+    assert_eq!(
+        outcome.stdout,
+        format!("got {}\n", whoami()),
+        "stderr: {}",
+        outcome.stderr
+    );
+    assert_eq!(outcome.status, 0);
+}
+
+#[test]
+fn alias_names_take_hyphens_and_a_missing_name_fails() {
+    // A temp HOME keeps the definition out of the user's real config.
+    let dir = temp_dir("alias-home");
+    let home = dir.to_string_lossy().into_owned();
+
+    // `/etc/profile.d/mingw64.sh` defines `alias mingw64-env=…`; names like
+    // that are legal for bash and dash, so they are legal here.
+    let outcome = run_with_env(
+        &["-c", "alias mingw64-env='echo m'; echo rc=$?"],
+        &[("HOME", home.as_str())],
+    );
+    assert_eq!(outcome.stdout, "rc=0\n", "stderr: {}", outcome.stderr);
+    assert_eq!(outcome.stderr, "", "stderr: {}", outcome.stderr);
+
+    // Asking about a name that does not exist is a failure (status 1), as in
+    // bash and dash.
+    let outcome = run_with_env(
+        &["-c", "alias nosuchalias; echo rc=$?"],
+        &[("HOME", home.as_str())],
+    );
+    assert_eq!(outcome.stdout, "rc=1\n");
+    assert!(outcome.stderr.contains("nosuchalias"), "{}", outcome.stderr);
+
+    // None of it may make a real login run noisy.
+    let outcome = run_with_env(&["-l", "-c", "echo login-ok"], &[("HOME", home.as_str())]);
+    assert_eq!(outcome.stdout, "login-ok\n", "stderr: {}", outcome.stderr);
+    assert!(!outcome.stderr.contains("alias:"), "{}", outcome.stderr);
     fs::remove_dir_all(&dir).ok();
 }
 

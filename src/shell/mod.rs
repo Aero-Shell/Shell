@@ -375,9 +375,17 @@ impl Shell {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) => {
-                registry::print_colored(&format!("ash: {path}: {error}"), "error");
-                self.last_status = 127;
-                return Flow::Status(127);
+                // A directory is "cannot execute" (126) where a missing file is
+                // "not found" (127), as bash reports both.
+                let status = if std::path::Path::new(path).is_dir() { 126 } else { 127 };
+                let reason = if status == 126 {
+                    "Is a directory".to_string()
+                } else {
+                    exec::clean_io_error(&error)
+                };
+                registry::print_colored(&format!("ash: {path}: {reason}"), "error");
+                self.last_status = status;
+                return Flow::Status(status);
             }
         };
         let saved_name = std::mem::replace(&mut self.script_name, path.to_string());
@@ -399,7 +407,10 @@ impl Shell {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) => {
-                registry::print_colored(&format!("ash: .: {path}: {error}"), "error");
+                registry::print_colored(
+                    &format!("ash: .: {path}: {}", exec::clean_io_error(&error)),
+                    "error",
+                );
                 self.last_status = 1;
                 return Flow::Status(1);
             }
