@@ -180,14 +180,6 @@ pub fn pwd(_args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-pub fn exit(args: &[&str]) -> Result<()> {
-    // Reached only from a pipeline (`true | exit`); a plain `exit` step is
-    // reported by the REPL/`-c` layer so the shell can unwind cleanly.
-    let status = exit_status(args, 0);
-    registry::print_colored("Exiting Ash...", "warning");
-    std::process::exit(status);
-}
-
 // The status `exit`/`quit` ends the shell with, given the arguments after the
 // command name and the status of the last command that ran. POSIX: no
 // argument keeps that last status, `exit n` exits with n — only the low eight
@@ -249,13 +241,25 @@ const HELP: &[HelpEntry] = &[
         "cd [dir]",
         "Change directory ('-' = previous, '~' = home)",
     ),
-    cmd("pwd", "Print working directory"),
-    cmd(
-        "history [n]",
+    cmd("pwd", "Print working directory"),    cmd("history [n]",
         "Show recent commands (last n); Ctrl-R searches them interactively",
     ),
     cmd("export VAR=val", "Set a session environment variable"),
-    cmd("unset VAR", "Remove a session environment variable"),
+    cmd("export [-p] [-n]", "List exported variables, or mark/unmark one"),
+    cmd("unset [-f] VAR", "Remove a session variable or function"),
+    cmd("readonly VAR[=val]", "Mark a variable read-only"),
+    cmd("exec [cmd [args…]]", "Replace the shell with cmd (or apply redirections)"),
+    cmd(". file [args…] (source)", "Run a file in the current shell"),
+    cmd("eval <cmd…>", "Run the arguments as a shell command"),
+    cmd("set [-eu] [--] [arg…]", "Set positional parameters and shell options"),
+    cmd("shift [n]", "Drop the first n positional parameters"),
+    cmd("trap [cmd] SIG…", "Set or list signal traps"),
+    cmd("times", "Print shell and children CPU times"),
+    cmd("return [n]", "Return from a function or sourced file"),
+    cmd("break [n] / continue [n]", "Leave or continue the enclosing loop"),
+    cmd("read [-r] VAR…", "Read a line from stdin into variables"),
+    cmd("command [-v] cmd", "Run a command; -v shows how it resolves"),
+    cmd("wait [pid…]", "Wait for background jobs"),
     HelpEntry {
         usage: "alias <subcommand>",
         summary: "Create, list or remove persistent aliases",
@@ -359,40 +363,40 @@ pub fn history(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-// export VAR=value; with no `=`, prints the current value.
-pub fn export(args: &[&str]) -> Result<()> {
-    for arg in args {
-        match arg.split_once('=') {
-            Some((name, _value)) if !is_valid_name(name) => {
-                registry::print_colored(&format!("export: invalid name: {name}"), "error");
-            }
-            Some((name, value)) => {
-                unsafe { std::env::set_var(name, value) };
-            }
-            None => match std::env::var(arg) {
-                Ok(value) => println!("{arg}={value}"),
-                Err(_) => registry::print_colored(&format!("export: not set: {arg}"), "warning"),
-            },
-        }
-    }
-    Ok(())
-}
-
-// unset VAR
-pub fn unset(args: &[&str]) -> Result<()> {
-    for name in args {
-        if !is_valid_name(name) {
-            registry::print_colored(&format!("unset: invalid name: {name}"), "error");
-            continue;
-        }
-        unsafe { std::env::remove_var(name) };
-    }
-    Ok(())
-}
-
 // alias create <alias> <command…>, alias ls, alias rm <alias>.
 // Aliases live in config.json so they survive restarts.
 pub fn alias(args: &[&str]) -> Result<()> {
+    // The POSIX forms — `alias name=value` to define, `alias name` to show
+    // one — are what login profiles in the wild use, so they come first.
+    // Everything after the subcommands below is Ash's own spelling.
+    if !args.is_empty() && !matches!(args[0], "create" | "ls" | "rm") {
+        let mut definitions: Vec<(String, String)> = Vec::new();
+        for arg in args {
+            match arg.split_once('=') {
+                Some((name, value)) => {
+                    if !is_valid_name(name) {
+                        registry::print_colored(&format!("alias: invalid name: {name}"), "error");
+                        continue;
+                    }
+                    definitions.push((name.to_string(), value.to_string()));
+                }
+                None => match registry::active_config()?.aliases.get(*arg) {
+                    Some(command) => println!("{arg} -> {command}"),
+                    None => {
+                        registry::print_colored(&format!("alias: {arg}: not found"), "error");
+                    }
+                },
+            }
+        }
+        if !definitions.is_empty() {
+            modify_config(|cfg| {
+                for (name, value) in definitions {
+                    cfg.aliases.insert(name, value);
+                }
+            })?;
+        }
+        return Ok(());
+    }
     match args {
         ["ls"] => {
             let mut aliases: Vec<_> = registry::active_config()?.aliases.into_iter().collect();
@@ -474,7 +478,9 @@ pub fn type_cmd(args: &[&str]) -> Result<()> {
         return Ok(());
     }
     for name in args {
-        if registry::resolve(name).is_some() {
+        if crate::shell::is_special_builtin(name) {
+            println!("{name} is a shell builtin");
+        } else if registry::resolve(name).is_some() {
             println!("{name} is a shell builtin");
         } else if let Some(path) = which_cmd(name) {
             println!("{name} is {path}");
@@ -512,6 +518,11 @@ pub fn command_candidates(word: &str) -> Vec<String> {
 
     let mut candidates: Vec<String> = Vec::new();
     candidates.extend(registry::names());
+    candidates.extend(
+        crate::shell::SPECIAL_BUILTINS
+            .iter()
+            .map(|name| (*name).to_string()),
+    );
     candidates.extend(executable_names());
     candidates.retain(|name| name.starts_with(word));
     candidates.sort();

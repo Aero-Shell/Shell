@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
@@ -227,7 +228,15 @@ pub fn load_config() -> Result<Config> {
     let default = default_config();
 
     if !path.exists() {
-        save_config(&default)?;
+        // A shell still has to come up when its state directory cannot be
+        // written — a read-only home, a container without one, `HOME` set to
+        // a path that does not exist. The defaults run commands fine.
+        if let Err(error) = save_config(&default) {
+            eprintln!(
+                "\x1b[33mWarning: cannot save default settings to {}: {error}\x1b[0m",
+                path.display()
+            );
+        }
         return Ok(default);
     }
 
@@ -360,8 +369,23 @@ pub fn colorize(text: &str, key: &str) -> String {
     format!("{}{}{}", color, text, reset)
 }
 
+// Print a coloured message. Diagnostics go to stderr, so a script's captured
+// stdout stays data even when a command complains; everything else (results,
+// confirmations) goes to stdout. Nothing is coloured when the stream it goes
+// to is not a terminal — a redirected `pwd` must print a bare path, not
+// escape codes.
 pub fn print_colored(text: &str, key: &str) {
-    println!("{}", colorize(text, key));
+    if matches!(key, "error" | "warning") {
+        if std::io::stderr().is_terminal() {
+            eprintln!("{}", colorize(text, key));
+        } else {
+            eprintln!("{text}");
+        }
+    } else if std::io::stdout().is_terminal() {
+        println!("{}", colorize(text, key));
+    } else {
+        println!("{text}");
+    }
 }
 
 pub fn ansi_for_color_key(key: &str) -> String {

@@ -151,7 +151,6 @@ cargo run
 
 Code layout:
 
-- `src/main.rs` — REPL, arg parsing, pipelines, login-shell handling
 - `src/history_search.rs` — searchable history picker (Ctrl-R / Up)
 - `src/commands/builtins.rs` — built-in commands
 - `src/commands/aepkg.rs` — package manager command
