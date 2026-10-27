@@ -123,8 +123,6 @@ pub struct Shell {
     /// Nesting depth of command substitutions / subshells, where `exec` must
     /// not replace the shell process.
     pub sub_depth: u32,
-    /// A `Flow` produced while waiting for a child (a trap asked to exit).
-    pub deferred: Option<Flow>,
 }
 
 /// Signals whose handlers have fired, waiting to run their trap commands.
@@ -181,7 +179,6 @@ impl Shell {
             loop_depth: 0,
             call_depth: 0,
             sub_depth: 0,
-            deferred: None,
         };
         if let Ok(cwd) = std::env::current_dir() {
             let cwd = cwd.to_string_lossy().into_owned();
@@ -349,9 +346,23 @@ impl Shell {
 
     // -- entry points -------------------------------------------------------
 
+    /// The aliases this shell expands. Only an interactive session uses the
+    /// ones from the config, where the `alias` command stores them: `ash -c
+    /// '…'` and `ash file.sh` start with none, so a personal alias can never
+    /// change what a script does.
+    pub fn aliases(&self) -> HashMap<String, String> {
+        if !self.options.interactive {
+            return HashMap::new();
+        }
+        crate::config::active_config()
+            .map(|config| config.aliases)
+            .unwrap_or_default()
+    }
+
     /// Parse and run `text` in this shell.
     pub fn run_text(&mut self, text: &str) -> Flow {
-        match parser::parse(text) {
+        let aliases = self.aliases();
+        match parser::parse(text, &aliases) {
             Ok(program) => self.exec_program(&program),
             Err(ParseError::Incomplete) => {
                 registry::print_colored(
@@ -375,15 +386,17 @@ impl Shell {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(error) => {
-                // A directory is "cannot execute" (126) where a missing file is
-                // "not found" (127), as bash reports both.
+                // A directory is "cannot execute" (126) where anything else is
+                // 127 — the status `ash file.sh` has always reported, though
+                // bash calls a file it may not read 126 too. The reason comes
+                // from the one table commands and `exec` use.
                 let status = if std::path::Path::new(path).is_dir() { 126 } else { 127 };
-                let reason = if status == 126 {
-                    "Is a directory".to_string()
+                let cause = if status == 126 {
+                    exec::Cause::Directory
                 } else {
-                    exec::clean_io_error(&error)
+                    exec::cause_of(&error)
                 };
-                registry::print_colored(&format!("ash: {path}: {reason}"), "error");
+                registry::print_colored(&format!("ash: {path}: {}", cause.reason()), "error");
                 self.last_status = status;
                 return Flow::Status(status);
             }

@@ -9,7 +9,6 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::rc::Rc;
 
-use crate::commands::builtins;
 use crate::packages;
 use crate::registry;
 
@@ -136,27 +135,160 @@ pub(crate) fn exec_operands(args: &[String]) -> &[String] {
     }
 }
 
-/// Resolve a command operand to a path. `Err` is the status a shell reports
-/// for the failure: 126 for something that exists but cannot be executed, 127
-/// for a name that resolves to nothing.
-fn resolve_operand(name: &str) -> Result<String, i32> {
-    if std::path::Path::new(name).is_dir() {
-        return Err(126);
-    }
-    builtins::which_cmd(name).ok_or(127)
-}
-
-/// Why an operand could not be run, in a shell's words rather than Rust's.
-fn operand_reason(status: i32) -> &'static str {
-    if status == 126 { "Is a directory" } else { "not found" }
-}
-
 /// `Is a directory (os error 21)`: a shell reports the reason, not the number.
 pub(crate) fn clean_io_error(error: &std::io::Error) -> String {
     let text = error.to_string();
     match text.split_once(" (os error ") {
         Some((reason, _)) => reason.to_string(),
         None => text,
+    }
+}
+
+/// Why a name cannot run, and the status a shell reports for it. One entry per
+/// cause: the plain command path, `exec`, `command` and the script file all
+/// take their status and their reason from here, so no two of them can drift
+/// apart.
+pub(crate) enum Cause {
+    /// The name resolves to a directory.
+    Directory,
+    /// The name resolves to a file the shell may not execute.
+    NotExecutable,
+    /// A path — the name contains a slash — that is not there.
+    PathMissing,
+    /// A word with no match on `PATH`.
+    NameUnknown,
+    /// The filesystem would not describe the name (a symbolic-link loop, a
+    /// name that is too long); the reason is what it said, as bash reports it.
+    Unreadable(String),
+}
+
+impl Cause {
+    /// 126 for something that exists but cannot execute, 127 for a name that
+    /// resolves to nothing — the statuses bash reports for the same inputs.
+    pub(crate) fn status(&self) -> i32 {
+        match self {
+            Cause::Directory | Cause::NotExecutable | Cause::Unreadable(_) => 126,
+            Cause::PathMissing | Cause::NameUnknown => 127,
+        }
+    }
+
+    /// The reason a command reports, after the name it failed on.
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Cause::Directory => "Is a directory".to_string(),
+            Cause::NotExecutable => "Permission denied".to_string(),
+            Cause::PathMissing => "No such file or directory".to_string(),
+            Cause::NameUnknown => "command not found".to_string(),
+            Cause::Unreadable(reason) => reason.clone(),
+        }
+    }
+
+    /// The reason `exec` reports. Bash words a name `exec` cannot find as
+    /// "not found", where a plain command says "command not found"; both of
+    /// `exec`'s 127 causes have said so since 1.2.3, and every other reason is
+    /// the one a command gets.
+    fn exec_reason(&self) -> String {
+        match self {
+            Cause::PathMissing | Cause::NameUnknown => "not found".to_string(),
+            other => other.reason(),
+        }
+    }
+}
+
+/// Why a name the shell could not inspect cannot run: one that is not there is
+/// missing, one it may not look at cannot execute, and anything else is
+/// reported in the filesystem's own words.
+pub(crate) fn cause_of(error: &std::io::Error) -> Cause {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => Cause::PathMissing,
+        std::io::ErrorKind::PermissionDenied => Cause::NotExecutable,
+        _ => Cause::Unreadable(clean_io_error(error)),
+    }
+}
+
+/// A command that cannot run: why, and the name its diagnostic reports.
+struct Unrunnable {
+    cause: Cause,
+    /// The word the diagnostic names. For a `PATH` hit that exists without
+    /// execute permission a shell reports the path it resolved to, not the
+    /// name that was typed.
+    target: String,
+}
+
+impl Unrunnable {
+    fn new(cause: Cause, target: &str) -> Unrunnable {
+        Unrunnable {
+            cause,
+            target: target.to_string(),
+        }
+    }
+
+    /// The status the shell leaves behind.
+    fn status(&self) -> i32 {
+        self.cause.status()
+    }
+
+    /// The diagnostic a command prints: `ash: <target>: <reason>`.
+    fn message(&self) -> String {
+        format!("ash: {}: {}", self.target, self.cause.reason())
+    }
+
+    /// The diagnostic `exec` prints: `ash: exec: <target>: <reason>`.
+    fn exec_message(&self) -> String {
+        format!("ash: exec: {}: {}", self.target, self.cause.exec_reason())
+    }
+}
+
+/// Whether the file may be executed: any execute bit, which is what `access(2)`
+/// grants a normal user and all root needs.
+fn is_executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.is_file() && (meta.permissions().mode() & 0o111 != 0)
+}
+
+/// Resolve a command name the way a shell does, so a name that cannot run gets
+/// the reason and the status bash reports for it: 126 for a directory or a file
+/// without execute permission, 127 for a path that is not there or a word that
+/// matches nothing on `PATH`.
+fn resolve_command(name: &str) -> Result<String, Unrunnable> {
+    if name.contains('/') {
+        let meta = match std::fs::metadata(name) {
+            Ok(meta) => meta,
+            Err(error) => return Err(Unrunnable::new(cause_of(&error), name)),
+        };
+        if meta.is_dir() {
+            return Err(Unrunnable::new(Cause::Directory, name));
+        }
+        if !is_executable(&meta) {
+            return Err(Unrunnable::new(Cause::NotExecutable, name));
+        }
+        return Ok(name.to_string());
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return Err(Unrunnable::new(Cause::NameUnknown, name));
+    };
+    // A candidate that exists without execute permission is remembered, not
+    // run: a later directory may still hold a runnable one, and only when
+    // nothing runs does it become the answer bash gives.
+    let mut denied: Option<String> = None;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        let Ok(meta) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if meta.is_dir() {
+            continue;
+        }
+        if is_executable(&meta) {
+            return Ok(candidate.to_string_lossy().into_owned());
+        }
+        if denied.is_none() {
+            denied = Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    match denied {
+        Some(path) => Err(Unrunnable::new(Cause::NotExecutable, &path)),
+        None => Err(Unrunnable::new(Cause::NameUnknown, name)),
     }
 }
 
@@ -178,7 +310,10 @@ pub(crate) fn with_redirects<T>(slots: &[FdSlot; 3], f: impl FnOnce() -> T) -> R
         if previous < 0 || unsafe { libc::dup2(target, fd as i32) } < 0 {
             let error = std::io::Error::last_os_error();
             restore_fds(&mut saved);
-            registry::print_colored(&format!("ash: redirection failed: {error}"), "error");
+            registry::print_colored(
+                &format!("ash: redirection failed: {}", clean_io_error(&error)),
+                "error",
+            );
             return Err(1);
         }
     }
@@ -234,7 +369,10 @@ fn apply_redirs_permanently(slots: &[FdSlot; 3]) -> Result<(), i32> {
         };
         if unsafe { libc::dup2(file.as_raw_fd(), fd as i32) } < 0 {
             let error = std::io::Error::last_os_error();
-            registry::print_colored(&format!("ash: redirection failed: {error}"), "error");
+            registry::print_colored(
+                &format!("ash: redirection failed: {}", clean_io_error(&error)),
+                "error",
+            );
             return Err(1);
         }
     }
@@ -328,8 +466,8 @@ struct Prepared {
 enum StageKind {
     /// An external program that was found on `PATH`.
     External(String),
-    /// An external program that is not on `PATH`.
-    NotFound,
+    /// A command that cannot be run, with the reason and status to report.
+    Unrunnable(Unrunnable),
     /// A special or registered builtin.
     Builtin,
     Compound,
@@ -511,22 +649,17 @@ impl Shell {
                     match self.spawn_external(path, expanded, resolved) {
                         Ok(pid) => children.push((index, pid)),
                         Err(error) => {
-                            let name = &expanded.argv[0];
                             registry::print_colored(
-                                &format!("ash: failed to run {name}: {error}"),
+                                &format!("ash: {path}: {}", clean_io_error(&error)),
                                 "error",
                             );
                             statuses[index] = Some(126);
                         }
                     }
                 }
-                StageKind::NotFound => {
-                    let name = &prepared[index].as_ref().expect("checked").argv[0];
-                    registry::print_colored(
-                        &format!("ash: command not found: {name}"),
-                        "error",
-                    );
-                    statuses[index] = Some(127);
+                StageKind::Unrunnable(failure) => {
+                    registry::print_colored(&failure.message(), "error");
+                    statuses[index] = Some(failure.status());
                 }
                 _ => {}
             }
@@ -537,7 +670,7 @@ impl Shell {
         for index in 0..n {
             if matches!(
                 kinds[index],
-                StageKind::External(_) | StageKind::NotFound
+                StageKind::External(_) | StageKind::Unrunnable(_)
             ) {
                 continue;
             }
@@ -671,7 +804,7 @@ impl Shell {
                     return StageKind::Exec;
                 }
                 if name == "unalias" {
-                    return StageKind::NotFound;
+                    return StageKind::Unrunnable(Unrunnable::new(Cause::NameUnknown, name));
                 }
                 if is_special_builtin(name) || registry::resolve(name).is_some() {
                     return StageKind::Builtin;
@@ -679,9 +812,9 @@ impl Shell {
                 if self.functions.contains_key(name) {
                     return StageKind::Function;
                 }
-                match builtins::which_cmd(name) {
-                    Some(path) => StageKind::External(path),
-                    None => StageKind::NotFound,
+                match resolve_command(name) {
+                    Ok(path) => StageKind::External(path),
+                    Err(failure) => StageKind::Unrunnable(failure),
                 }
             }
         }
@@ -813,17 +946,12 @@ impl Shell {
                 argv
             },
         };
-        match resolve_operand(name) {
+        match resolve_command(name) {
             Ok(path) => self.run_external(&path, &prepared),
-            Err(status) => {
-                let message = if status == 126 {
-                    format!("ash: {name}: {}", operand_reason(status))
-                } else {
-                    format!("ash: command not found: {name}")
-                };
-                registry::print_colored(&message, "error");
-                self.last_status = status;
-                Flow::Status(status)
+            Err(failure) => {
+                registry::print_colored(&failure.message(), "error");
+                self.last_status = failure.status();
+                Flow::Status(failure.status())
             }
         }
     }
@@ -1032,15 +1160,12 @@ impl Shell {
             return Flow::Status(0);
         }
         let name = &args[0];
-        let path = match resolve_operand(name) {
+        let path = match resolve_command(name) {
             Ok(path) => path,
-            Err(status) => {
-                registry::print_colored(
-                    &format!("ash: exec: {name}: {}", operand_reason(status)),
-                    "error",
-                );
-                self.last_status = status;
-                return self.exec_failed(status);
+            Err(failure) => {
+                registry::print_colored(&failure.exec_message(), "error");
+                self.last_status = failure.status();
+                return self.exec_failed(failure.status());
             }
         };
         if let Err(status) = apply_redirs_permanently(slots) {
@@ -1131,8 +1256,10 @@ impl Shell {
                 }
             }
             Err(error) => {
-                let name = prepared.argv.first().map(String::as_str).unwrap_or(path);
-                registry::print_colored(&format!("ash: failed to run {name}: {error}"), "error");
+                registry::print_colored(
+                    &format!("ash: {path}: {}", clean_io_error(&error)),
+                    "error",
+                );
                 self.last_status = 126;
                 Flow::Status(126)
             }
@@ -1163,7 +1290,8 @@ impl Shell {
 
     /// Run `text` with its stdout captured, like `$(...)` and `` `...` ``.
     pub(crate) fn command_substitute(&mut self, text: &str) -> Result<String, ExpandError> {
-        let program = match super::parser::parse(text) {
+        let aliases = self.aliases();
+        let program = match super::parser::parse(text, &aliases) {
             Ok(program) => program,
             Err(super::parser::ParseError::Incomplete) => {
                 registry::print_colored("ash: syntax error: unexpected end of file", "error");
@@ -1181,7 +1309,10 @@ impl Shell {
             Ok(file) => file,
             Err(error) => {
                 registry::print_colored(
-                    &format!("ash: cannot capture command substitution: {error}"),
+                    &format!(
+                        "ash: cannot capture command substitution: {}",
+                        clean_io_error(&error)
+                    ),
                     "error",
                 );
                 self.last_cmdsub_status = 1;
@@ -1192,7 +1323,10 @@ impl Shell {
             Ok(reader) => reader,
             Err(error) => {
                 registry::print_colored(
-                    &format!("ash: cannot capture command substitution: {error}"),
+                    &format!(
+                        "ash: cannot capture command substitution: {}",
+                        clean_io_error(&error)
+                    ),
                     "error",
                 );
                 self.last_cmdsub_status = 1;
@@ -1473,55 +1607,6 @@ mod tests {
     }
 
     #[test]
-    fn redirections_write_files_and_feed_heredocs() {
-        let dir = std::env::temp_dir().join(format!("ash-redir-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let _guard = serial();
-        let out = dir.join("out.txt");
-        let mut first = new_shell();
-        let line = format!("echo hello > {}", out.to_string_lossy());
-        assert_eq!(first.run_text(&line).status(), 0);
-        assert_eq!(std::fs::read_to_string(&out).unwrap(), "hello\n");
-
-        // Heredoc into an external command: an unquoted delimiter expands the
-        // body like a double-quoted string (bash's result, byte for byte).
-        let mut second = new_shell();
-        second.set_var("ASH_WORD", "expanded", false).unwrap();
-        let line = format!(
-            "cat <<EOF > {}\n$ASH_WORD ${{ASH_WORD}} $(/bin/echo sub)\nEOF\n",
-            out.to_string_lossy()
-        );
-        assert_eq!(second.run_text(&line).status(), 0);
-        assert_eq!(
-            std::fs::read_to_string(&out).unwrap(),
-            "expanded expanded sub\n"
-        );
-
-        // A quoted delimiter leaves the body alone.
-        let mut third = new_shell();
-        let line = format!(
-            "cat <<'EOF' > {}\n$ASH_WORD $(/bin/echo sub)\nEOF\n",
-            out.to_string_lossy()
-        );
-        assert_eq!(third.run_text(&line).status(), 0);
-        assert_eq!(
-            std::fs::read_to_string(&out).unwrap(),
-            "$ASH_WORD $(/bin/echo sub)\n"
-        );
-
-        // A backslash in an unquoted body escapes `$`, `\\` and a newline —
-        // and nothing else.
-        let mut fourth = new_shell();
-        let line = format!(
-            "cat <<EOF > {}\na\\$ASH_WORD b\\\\c \\\nd\nEOF\n",
-            out.to_string_lossy()
-        );
-        assert_eq!(fourth.run_text(&line).status(), 0);
-        assert_eq!(std::fs::read_to_string(&out).unwrap(), "a$ASH_WORD b\\c d\n");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn pipelines_run_builtins_and_externals_together() {
         assert_eq!(run("echo hi | cat"), 0);
         assert_eq!(run("false | true"), 0);
@@ -1540,17 +1625,20 @@ mod tests {
         assert_eq!(run("set -e; true && false; exit 0"), 1);
     }
 
+    /// What a substitution *captures* is asserted through the real binary
+    /// (`tests/cli.rs`): the harness prints on the descriptor the shell
+    /// captures, so text compared in-process would race with it. What can be
+    /// checked here is that nothing it sets escapes.
     #[test]
-    fn command_substitution_captures_output_without_leaking_state() {
+    fn command_substitution_does_not_leak_state_into_the_shell() {
         let _guard = serial();
         let before = std::env::current_dir().unwrap();
         let mut shell = new_shell();
-        assert_eq!(shell.run_text("X=$(echo one); echo $X").status(), 0);
-        assert_eq!(shell.get_var("X").as_deref(), Some("one"));
-        // A `cd` inside the substitution must not move the shell. What a
-        // *builtin* like `pwd` prints is captured through the real binary
-        // only — the test harness claims `println!` — so tests/cli.rs covers
-        // the text and this checks the isolation.
+        assert_eq!(
+            shell.run_text("Z=$(ASH_LEAK=1; echo x); exit 0").status(),
+            0
+        );
+        assert_eq!(shell.get_var("ASH_LEAK"), None);
         assert_eq!(shell.run_text("Y=$(cd /); exit 0").status(), 0);
         assert_eq!(
             std::env::current_dir().unwrap(),

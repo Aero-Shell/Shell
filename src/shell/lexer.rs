@@ -187,12 +187,6 @@ pub enum Token {
     Newline,
 }
 
-impl Token {
-    pub fn is_op(&self, op: &Op) -> bool {
-        matches!(self, Token::Op(found) if found == op)
-    }
-}
-
 pub struct Lexed {
     pub tokens: Vec<Token>,
 }
@@ -1296,7 +1290,6 @@ mod tests {
         let (name, value) = word.as_assignment().unwrap();
         assert_eq!(name, "Y");
         assert!(matches!(value.segs[0], Seg::Param { quoted: true, .. }));
-        assert!(lex("a b").unwrap().tokens.first().is_some());
     }
 
     #[test]

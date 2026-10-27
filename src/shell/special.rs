@@ -464,7 +464,8 @@ impl Shell {
         if text.trim().is_empty() {
             return Flow::Status(0);
         }
-        match super::parser::parse(&text) {
+        let aliases = self.aliases();
+        match super::parser::parse(&text, &aliases) {
             Ok(program) => self.exec_program(&program),
             Err(super::parser::ParseError::Incomplete) => {
                 registry::print_colored("ash: syntax error: unexpected end of file", "error");

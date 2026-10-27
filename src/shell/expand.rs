@@ -1207,20 +1207,9 @@ mod tests {
         assert_eq!(shell.expand_word(&word, ExpandMode::Normal).unwrap(), ["a~"]);
     }
 
-    #[test]
-    fn command_substitution_runs_and_strips_newlines() {
-        let _guard = crate::shell::TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut shell = new_shell();
-        let word = crate::shell::lexer::lex_fragment("x$(echo hi)y");
-        assert_eq!(
-            shell.expand_word(&word, ExpandMode::Normal).unwrap(),
-            ["xhiy"]
-        );
-        let word = crate::shell::lexer::lex_fragment("$(true)");
-        assert!(shell.expand_word(&word, ExpandMode::Normal).unwrap().is_empty());
-    }
+    // What a substitution captures is asserted through the real binary
+    // (`tests/cli.rs`): the harness prints on the descriptor the shell
+    // captures, so comparing the captured text in-process races with it.
 
     #[test]
     fn splitting_handles_separator_classes() {

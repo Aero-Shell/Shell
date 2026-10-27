@@ -8,6 +8,8 @@
 //! Reserved words are only recognized in command position, exactly as POSIX
 //! requires, so `echo then` passes `then` through as an ordinary argument.
 
+use std::collections::HashMap;
+
 use super::alias;
 use super::lexer::{self, LexError, Op, RedirOp, Token, Word};
 
@@ -162,12 +164,13 @@ pub fn is_reserved(word: &str) -> bool {
 // Parser
 // ---------------------------------------------------------------------------
 
-pub fn parse(text: &str) -> Result<Program, ParseError> {
+/// Parse `text` into the command tree. `aliases` are the ones this shell
+/// expands: an interactive session passes its config, a non-interactive one
+/// passes an empty map so a personal alias cannot change what `ash -c '…'` or
+/// a script does.
+pub fn parse(text: &str, aliases: &HashMap<String, String>) -> Result<Program, ParseError> {
     let lexed = lexer::lex(text)?;
-    let aliases = crate::config::active_config()
-        .map(|config| config.aliases)
-        .unwrap_or_default();
-    let tokens = alias::expand_tokens(lexed.tokens, &aliases);
+    let tokens = alias::expand_tokens(lexed.tokens, aliases);
     let mut parser = Parser { toks: tokens, pos: 0 };
     let program = parser.parse_program(&[])?;
     parser.skip_newlines();
@@ -178,11 +181,6 @@ pub fn parse(text: &str) -> Result<Program, ParseError> {
         )));
     }
     Ok(program)
-}
-
-/// Parse a single word fragment as used by `${x:-…}` defaults. Never fails.
-pub fn parse_fragment(text: &str) -> Word {
-    lexer::lex_fragment(text)
 }
 
 struct Parser {
@@ -683,8 +681,13 @@ mod tests {
     use super::*;
     use crate::shell::lexer::Seg;
 
+    /// The parser's own tests are about syntax, so aliases are not in play.
+    fn parse_text(line: &str) -> Result<Program, ParseError> {
+        parse(line, &HashMap::new())
+    }
+
     fn parse_ok(line: &str) -> Program {
-        parse(line).unwrap_or_else(|e| panic!("{line:?}: {e:?}"))
+        parse_text(line).unwrap_or_else(|e| panic!("{line:?}: {e:?}"))
     }
 
     /// The words of every simple command, with expansions left untouched.
@@ -950,7 +953,7 @@ mod tests {
             "cat <<EOF\nbody",
         ] {
             assert!(
-                matches!(parse(line), Err(ParseError::Incomplete)),
+                matches!(parse_text(line), Err(ParseError::Incomplete)),
                 "{line:?} should be incomplete"
             );
         }
@@ -965,7 +968,7 @@ mod tests {
             ("echo (", "'('"),
             ("echo hi >", "end of file"),
         ] {
-            match parse(line) {
+            match parse_text(line) {
                 Err(ParseError::Incomplete) if token == "end of file" => {}
                 Err(ParseError::Incomplete) => panic!("{line:?} unexpectedly incomplete"),
                 Err(ParseError::Message(message)) => {

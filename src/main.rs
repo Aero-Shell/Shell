@@ -510,7 +510,10 @@ fn run_repl(shell: &mut Shell) -> Result<()> {
             continue;
         }
 
-        match parser::parse(&buffer) {
+        // The prompt is the interactive path, so it is where the user's own
+        // aliases apply; scripts and `-c` never see them.
+        let aliases = shell.aliases();
+        match parser::parse(&buffer, &aliases) {
             Err(parser::ParseError::Incomplete) => continue,
             Err(parser::ParseError::Message(message)) => {
                 registry::print_colored(&message, "error");

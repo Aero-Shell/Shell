@@ -1,10 +1,12 @@
 //! End-to-end tests for the surfaces a script, a session manager or a login
 //! profile drives: `ash -c '…'`, `ash script.sh …` and `ash -l -c '…'`.
 //!
-//! The unit tests inside `src/shell` cover the evaluator in-process; builtin
-//! output cannot be captured through a redirected descriptor there, because
-//! the test harness claims `println!`. These tests run the real binary and
-//! read its actual stdout, stderr and exit status.
+//! The unit tests inside `src/shell` cover the evaluator in-process; anything
+//! a descriptor carries belongs here instead, because a capture taken
+//! in-process shares that descriptor with the test harness's own output — and
+//! the harness also claims `println!`, so what a builtin prints never reaches
+//! it. These tests run the real binary and read its actual stdout, stderr and
+//! exit status.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -100,7 +102,15 @@ fn exec_reports_its_failure_and_ends_a_non_interactive_shell() {
     let outcome = shell("exec /no/such/ash-test-binary; echo after");
     assert_eq!(outcome.status, 127, "stderr: {}", outcome.stderr);
     assert!(!outcome.stdout.contains("after"));
-    assert!(outcome.stderr.contains("not found"), "{}", outcome.stderr);
+    // `exec` keeps the wording it has always used for an operand it cannot
+    // find; bash words a missing path "No such file or directory".
+    assert!(
+        outcome
+            .stderr
+            .contains("ash: exec: /no/such/ash-test-binary: not found"),
+        "{}",
+        outcome.stderr
+    );
 }
 
 #[test]
@@ -143,7 +153,7 @@ fn exec_option_terminator_and_operand_statuses() {
     assert_eq!(outcome.status, 126, "stderr: {}", outcome.stderr);
     assert!(!outcome.stdout.contains("after"), "{}", outcome.stdout);
     assert!(
-        outcome.stderr.contains("/tmp: Is a directory"),
+        outcome.stderr.contains("ash: exec: /tmp: Is a directory"),
         "{}",
         outcome.stderr
     );
@@ -168,6 +178,111 @@ fn exec_option_terminator_and_operand_statuses() {
         outcome.stderr
     );
     assert!(!outcome.stderr.contains("os error"), "{}", outcome.stderr);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn unrunnable_commands_report_the_reason_a_shell_reports() {
+    // Bash's status and wording for each way a command cannot run: everything
+    // that exists but cannot execute is 126, everything that resolves to
+    // nothing is 127, and no diagnostic carries Rust's `(os error N)`.
+    let cases = [
+        ("/tmp", 126, "/tmp: Is a directory"),
+        ("/etc/hostname", 126, "/etc/hostname: Permission denied"),
+        (
+            "/no/such/ash-cmd",
+            127,
+            "/no/such/ash-cmd: No such file or directory",
+        ),
+        ("./nope", 127, "./nope: No such file or directory"),
+        (
+            "ash-no-such-command",
+            127,
+            "ash-no-such-command: command not found",
+        ),
+        // `command` runs a name through the same table, with the same reasons
+        // and statuses.
+        ("command /tmp", 126, "/tmp: Is a directory"),
+        (
+            "command /no/such/ash-cmd",
+            127,
+            "/no/such/ash-cmd: No such file or directory",
+        ),
+        (
+            "command ash-no-such-command",
+            127,
+            "ash-no-such-command: command not found",
+        ),
+    ];
+    for (command, status, message) in cases {
+        let outcome = shell(command);
+        assert_eq!(outcome.status, status, "{command}: {}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains(message),
+            "{command}: {}",
+            outcome.stderr
+        );
+        assert!(!outcome.stderr.contains("os error"), "{command}: {}", outcome.stderr);
+    }
+
+    // The same failures inside a script, which keeps going and reports each
+    // status.
+    let dir = temp_dir("unrunnable");
+    let script = write_script(
+        &dir,
+        "unrunnable.sh",
+        "/tmp\necho first=$?\n./nope\necho second=$?\nash-no-such-command\necho third=$?\n",
+    );
+    let outcome = run(&[&script.to_string_lossy()]);
+    assert_eq!(outcome.status, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(outcome.stdout, "first=126\nsecond=127\nthird=127\n");
+    assert!(
+        outcome.stderr.contains("/tmp: Is a directory"),
+        "{}",
+        outcome.stderr
+    );
+    assert!(
+        outcome.stderr.contains("./nope: No such file or directory"),
+        "{}",
+        outcome.stderr
+    );
+    assert!(!outcome.stderr.contains("os error"), "{}", outcome.stderr);
+
+    // A `PATH` hit that exists without execute permission is 126 and names the
+    // path it resolved to; a directory in `PATH` is skipped, so a later
+    // directory can still hold the program.
+    let bin_one = dir.join("bin1");
+    let bin_two = dir.join("bin2");
+    fs::create_dir_all(bin_one.join("adir")).expect("create bin dirs");
+    fs::create_dir_all(&bin_two).expect("create bin dirs");
+    write_script(&bin_one, "plain", "echo never-runs\n");
+    write_executable(&bin_two, "plain", "#!/bin/sh\necho from-bin2\n");
+
+    let path = format!("{}:{}", bin_one.display(), bin_two.display());
+    let outcome = run_with_env(&["-c", "plain"], &[("PATH", &path)]);
+    assert_eq!(outcome.status, 0, "stderr: {}", outcome.stderr);
+    assert_eq!(outcome.stdout, "from-bin2\n");
+
+    let outcome = run_with_env(&["-c", "adir"], &[("PATH", &path)]);
+    assert_eq!(outcome.status, 127, "stderr: {}", outcome.stderr);
+    assert!(
+        outcome.stderr.contains("adir: command not found"),
+        "{}",
+        outcome.stderr
+    );
+
+    let only_unrunnable = bin_one.display().to_string();
+    let outcome = run_with_env(&["-c", "plain"], &[("PATH", &only_unrunnable)]);
+    assert_eq!(outcome.status, 126, "stderr: {}", outcome.stderr);
+    assert!(
+        outcome
+            .stderr
+            .contains(&format!("{}/plain: Permission denied", bin_one.display())),
+        "{}",
+        outcome.stderr
+    );
+    assert!(!outcome.stderr.contains("os error"), "{}", outcome.stderr);
+
     fs::remove_dir_all(&dir).ok();
 }
 
@@ -211,6 +326,25 @@ fn heredoc_bodies_expand_unless_the_delimiter_is_quoted() {
         outcome.stderr
     );
     assert_eq!(outcome.status, 0);
+
+    // A heredoc whose command writes to a file expands the same way, and the
+    // body is on the file the redirection names.
+    let dir = temp_dir("heredoc-file");
+    let target = dir.join("out.txt").display().to_string();
+    let script = write_script(
+        &dir,
+        "heredoc-file.sh",
+        &format!(
+            "W=expanded\ncat <<BODY > {target}\n$W ${{W}} $(/bin/echo sub)\nBODY\ncat <<'QUOTED' >> {target}\n$W $(/bin/echo sub)\nQUOTED\ncat {target}\n"
+        ),
+    );
+    let outcome = run(&[&script.to_string_lossy()]);
+    assert_eq!(
+        outcome.stdout, "expanded expanded sub\n$W $(/bin/echo sub)\n",
+        "stderr: {}",
+        outcome.stderr
+    );
+    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -313,6 +447,18 @@ fn parameters_and_command_substitution_expand() {
     // part of the word it sat in.
     let outcome = shell("Y=$(cd /; pwd); echo \"[$Y]\" \"$(pwd)\"");
     assert!(outcome.stdout.starts_with("[/] "), "{}", outcome.stdout);
+
+    // The captured text is spliced into its word, its trailing newlines are
+    // stripped, and a substitution that captures nothing contributes no field.
+    assert_eq!(shell("printf '[%s]' x$(echo hi)y").stdout, "[xhiy]");
+    assert_eq!(shell("printf '[%s]' \"$(echo hi)\"").stdout, "[hi]");
+    assert_eq!(shell("set -- $(true); echo $#").stdout, "0\n");
+
+    // Variables and the working directory a substitution sets stay inside it.
+    assert_eq!(
+        shell("Z=$(ASH_LEAK=1; cd /; pwd); echo \"z=$Z leak=${ASH_LEAK-unset}\"").stdout,
+        "z=/ leak=unset\n"
+    );
 }
 
 #[test]
@@ -383,12 +529,11 @@ fn a_non_option_argument_is_read_as_a_script_file() {
 #[test]
 fn a_login_shell_reads_the_profiles_first() {
     let dir = temp_dir("login");
-    let profile = write_script(
+    write_script(
         &dir,
         ".profile",
         "export ASH_LOGIN_SENTINEL=from-profile\nPATH=/usr/bin:/bin:$PATH\n",
     );
-    assert!(profile.exists());
     let home = dir.to_string_lossy().into_owned();
 
     let outcome = run_with_env(
@@ -449,4 +594,64 @@ fn pipelines_sequencing_and_redirection_work_in_one_liners() {
     assert_eq!(shell("true | false").status, 1);
     assert_eq!(shell("echo one > /tmp/ash-cli-out.txt && cat < /tmp/ash-cli-out.txt").stdout, "one\n");
     fs::remove_file("/tmp/ash-cli-out.txt").ok();
+}
+
+#[test]
+fn a_script_is_not_changed_by_the_configs_aliases() {
+    // A personal alias named `x` used to reach `-c` and scripts, where it was
+    // expanded inside a `case` pattern and made the shell refuse to parse.
+    let dir = temp_dir("alias-isolation");
+    let home = dir.to_string_lossy().into_owned();
+    // Define the alias the way a user would, so the config is the real thing.
+    let outcome = run_with_env(&["-c", "alias x='echo hi'"], &[("HOME", &home)]);
+    assert_eq!(outcome.status, 0, "stderr: {}", outcome.stderr);
+    let config = dir.join(".aeroshell").join("config.json");
+    assert!(
+        fs::read_to_string(&config).unwrap().contains("\"x\""),
+        "the alias was not persisted"
+    );
+
+    // `-c`: the pattern stays a pattern, and the alias is not a command.
+    let outcome = run_with_env(&["-c", "case x in a) :;; x) echo X;; esac"], &[("HOME", &home)]);
+    assert_eq!(outcome.stdout, "X\n", "stderr: {}", outcome.stderr);
+    assert_eq!(outcome.status, 0);
+    let outcome = run_with_env(&["-c", "x"], &[("HOME", &home)]);
+    assert_eq!(outcome.status, 127, "stderr: {}", outcome.stderr);
+
+    // The same lines from a script file, and from stdin.
+    let script = write_script(
+        &dir,
+        "alias_script.sh",
+        "case x in a) :;; x) echo script-X;; esac\nx\necho \"last=$?\"\n",
+    );
+    let path = script.to_string_lossy().into_owned();
+    let outcome = run_with_env(&[&path], &[("HOME", &home)]);
+    assert_eq!(outcome.stdout, "script-X\nlast=127\n", "stderr: {}", outcome.stderr);
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_aeroshell"));
+    command
+        .env("HOME", &home)
+        .stdin(fs::File::open(&script).unwrap());
+    let output = command.output().expect("run ash with stdin");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The REPL prints its banner before reading; the alias must not expand.
+    assert!(stdout.ends_with("script-X\nlast=127\n"), "stdout: {stdout}");
+    assert!(!stdout.contains("hi\n"), "the alias body ran: {stdout}");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn config_aliases_are_used_only_by_an_interactive_shell() {
+    // The config is the interactive session's store: a scripted shell starts
+    // without those aliases, which is what keeps `-c` and files predictable.
+    let mut config = aeroshell::config::Config::default_template();
+    config
+        .aliases
+        .insert("ash-test-interactive".into(), "echo hi".into());
+    aeroshell::config::set_config(config);
+
+    let interactive = aeroshell::shell::Shell::new(true);
+    assert!(interactive.aliases().contains_key("ash-test-interactive"));
+    let scripted = aeroshell::shell::Shell::new(false);
+    assert!(scripted.aliases().is_empty());
 }

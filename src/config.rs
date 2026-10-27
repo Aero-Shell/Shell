@@ -43,7 +43,8 @@ pub struct Config {
     pub prompt_template: String,
     #[serde(default)]
     pub colors: HashMap<String, String>,
-    // Persistent aliases, applied to the first word of each command stage.
+    // Persistent aliases. An interactive session expands them where a command
+    // name can appear; `-c` and script runs start without them.
     #[serde(default)]
     pub aliases: HashMap<String, String>,
 }
