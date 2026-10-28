@@ -172,7 +172,10 @@ impl ConditionalEventHandler for OpenHistorySearch {
         _positive: bool,
         ctx: &EventContext,
     ) -> Option<Cmd> {
-        if self.needs_prefix && ctx.line().trim().is_empty() {
+        // Only a line the helper can still complete is a partial command. A
+        // command recalled from history is complete, so Up keeps browsing
+        // instead of re-opening the picker on the entry it just recalled.
+        if self.needs_prefix && (ctx.line().trim().is_empty() || !ctx.has_hint()) {
             return Some(Cmd::PreviousHistory);
         }
         let hint_len = ctx.hint_text().map_or(0, |hint| hint.chars().count());
