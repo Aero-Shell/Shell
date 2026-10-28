@@ -9,7 +9,9 @@ use rustyline::{
     EventHandler, KeyCode, KeyEvent, Modifiers, Movement, RepeatCount,
 };
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::io::{IsTerminal, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -463,8 +465,21 @@ fn run_repl(shell: &mut Shell) -> Result<()> {
         );
     }
 
+    // A history written before repeats were filtered (or by another shell)
+    // can hold the same command many times; compact it once at startup so the
+    // picker and `history` start clean.
     if let Ok(path) = config::history_path() {
         let _ = rl.load_history(&path);
+        // Leave a file that exists but cannot be read untouched: rewriting it
+        // from memory would drop the entries this shell never saw.
+        if let Some(disk) = disk_history(&path) {
+            let entries = history_entries(&rl);
+            let merged = merge_history(&disk, &entries);
+            if merged != disk && !merged.is_empty() {
+                replace_history(&mut rl, merged);
+                let _ = rl.save_history(&path);
+            }
+        }
     }
 
     // One command may arrive over several lines (an `if` block, a heredoc):
@@ -522,7 +537,13 @@ fn run_repl(shell: &mut Shell) -> Result<()> {
             Ok(program) => {
                 rl.add_history_entry(&buffer).ok();
                 if let Ok(path) = config::history_path() {
-                    let _ = rl.append_history(&path);
+                    if compact_history(&mut rl, &path) {
+                        // Old copies were removed, so the file has to be
+                        // rewritten rather than appended to.
+                        let _ = rl.save_history(&path);
+                    } else {
+                        let _ = rl.append_history(&path);
+                    }
                 }
                 let flow = shell.exec_program(&program);
                 if let Flow::Exit(status) = flow {
@@ -576,6 +597,89 @@ fn read_prompt_line(
 // Every in-memory history entry, oldest first.
 fn history_entries(rl: &Editor<AeroHelper, DefaultHistory>) -> Vec<String> {
     rl.history().iter().cloned().collect()
+}
+
+// Every entry currently in the history file, repeats included (a reload drops
+// consecutive repeats, so that filter is off here). This is the other shells'
+// view of history. A missing file reads as empty; `None` means the file exists
+// but could not be read, and callers must not rewrite it.
+fn disk_history(path: &Path) -> Option<Vec<String>> {
+    let config = RLConfig::builder()
+        .history_ignore_dups(false)
+        .map(|builder| builder.build())
+        .unwrap_or_default();
+    let mut history = DefaultHistory::with_config(&config);
+    match history.load(path) {
+        Ok(()) => Some(history.iter().cloned().collect()),
+        Err(rustyline::error::ReadlineError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Some(Vec::new())
+        }
+        Err(_) => None,
+    }
+}
+
+// Merge this shell's history with the file's without losing either side: the
+// shared prefix comes first, then entries only the file has (another shell
+// wrote them since this one loaded), then entries only this shell has (the
+// command that was just run). Each command keeps its newest position.
+fn merge_history(disk: &[String], session: &[String]) -> Vec<String> {
+    let shared = disk
+        .iter()
+        .zip(session)
+        .take_while(|(disk_entry, session_entry)| disk_entry == session_entry)
+        .count();
+    let mut merged = Vec::with_capacity(disk.len() + session.len());
+    merged.extend_from_slice(&session[..shared]);
+    merged.extend_from_slice(&disk[shared..]);
+    merged.extend_from_slice(&session[shared..]);
+    unique_history(&merged)
+}
+
+// Keep only the newest copy of each command, preserving history order.
+fn unique_history(entries: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::with_capacity(entries.len());
+    for entry in entries.iter().rev() {
+        if seen.insert(entry.as_str()) {
+            unique.push(entry.clone());
+        }
+    }
+    unique.reverse();
+    unique
+}
+
+// Rebuild the history from `entries`. rustyline can only clear or append, so
+// removing an older duplicate means repopulating the list.
+fn replace_history(rl: &mut Editor<AeroHelper, DefaultHistory>, entries: Vec<String>) {
+    rl.clear_history().ok();
+    for entry in entries {
+        rl.add_history_entry(entry).ok();
+    }
+}
+
+// Drop older copies of a command that was run again, so it lands at the end
+// of history instead of being recorded another time. Commands other shells
+// wrote in the meantime are merged back in. Returns whether anything was
+// removed, which means the file has to be rewritten.
+fn compact_history(rl: &mut Editor<AeroHelper, DefaultHistory>, path: &Path) -> bool {
+    let entries = history_entries(rl);
+    let unique = unique_history(&entries);
+    if unique.len() == entries.len() {
+        return false;
+    }
+    // Merge the full session list rather than `unique`: its older copies are
+    // what line this shell's history up with the file's, so commands another
+    // shell added in between keep their place in time. Without a readable
+    // file there is nothing to merge, and appending is safe where rewriting
+    // is not.
+    let Some(disk) = disk_history(path) else {
+        return false;
+    };
+    let merged = merge_history(&disk, &entries);
+    replace_history(rl, merged);
+    true
 }
 
 // Split `text` at `pos`, backing up to the nearest character boundary so the
@@ -804,6 +908,44 @@ mod tests {
         assert!(helper.highlight_char("ec", 2, CmdKind::MoveCursor));
         assert!(helper.highlight_char("ec", 1, CmdKind::MoveCursor));
         assert!(!helper.hint_state.shown());
+    }
+
+    #[test]
+    fn unique_history_keeps_the_newest_copy_in_order() {
+        let entries = v(&["make", "git status", "make", "cargo test", "git status"]);
+        assert_eq!(unique_history(&entries), ["make", "cargo test", "git status"]);
+        assert_eq!(unique_history(&v(&[])), Vec::<String>::new());
+        assert_eq!(unique_history(&v(&["ls", "ls", "ls"])), ["ls"]);
+    }
+
+    #[test]
+    fn merge_history_keeps_commands_another_shell_wrote() {
+        // This shell ran `make` again while another one appended `git status`.
+        let disk = v(&["make", "make test", "git status"]);
+        let session = v(&["make", "make test", "make"]);
+        assert_eq!(
+            merge_history(&disk, &session),
+            ["make test", "git status", "make"]
+        );
+
+        // Histories that no longer line up still lose nothing.
+        assert_eq!(
+            merge_history(&v(&["b", "a"]), &v(&["a", "b", "c"])),
+            ["a", "b", "c"]
+        );
+        assert_eq!(merge_history(&v(&[]), &v(&["ls"])), ["ls"]);
+        assert_eq!(merge_history(&v(&["ls"]), &v(&[])), ["ls"]);
+    }
+
+    #[test]
+    fn disk_history_tells_a_missing_file_from_an_unreadable_one() {
+        let dir = std::env::temp_dir().join(format!("ash-history-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let missing = dir.join("missing.txt");
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!(disk_history(&missing), Some(Vec::new()));
+        // A directory exists but cannot be read as a history file.
+        assert_eq!(disk_history(&dir), None);
     }
 
     #[test]
